@@ -72,7 +72,7 @@ UnityMCP/
 
 ```bash
 cd <项目>/Tools/MCPForUnityServer   # 或本仓库 Server~/
-uv run pytest
+uv run --extra dev pytest
 ```
 
 ## 许可
