@@ -48,6 +48,10 @@ class ExternalChangesScanner:
     def _get_state(self, instance_id: str) -> ExternalChangesState:
         return self._states.setdefault(instance_id, ExternalChangesState())
 
+    def project_root_for(self, instance_id: str) -> str | None:
+        """Return the cached project root for an instance, if already known."""
+        return self._get_state(instance_id).project_root
+
     def set_project_root(self, instance_id: str, project_root: str | None) -> None:
         st = self._get_state(instance_id)
         if project_root:

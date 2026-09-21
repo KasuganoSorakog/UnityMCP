@@ -223,14 +223,16 @@ class PluginHub(WebSocketEndpoint):
             return
         async with lock:
             cls._connections.pop(session_id, None)
-            # Fail-fast any in-flight commands for this session to avoid waiting for COMMAND_TIMEOUT.
+            # Fail-fast any in-flight commands for this session to avoid waiting
+            # for COMMAND_TIMEOUT. Entries are popped here (not just failed) so a
+            # send_command whose finally-block is cancelled twice cannot leak them.
             pending_ids = [
                 command_id
                 for command_id, entry in cls._pending.items()
                 if entry.get("session_id") == session_id
             ]
             for command_id in pending_ids:
-                entry = cls._pending.get(command_id)
+                entry = cls._pending.pop(command_id, None)
                 future = entry.get("future") if isinstance(
                     entry, dict) else None
                 if future and not future.done():
@@ -667,6 +669,12 @@ class PluginHub(WebSocketEndpoint):
                 if candidate_ws is not None and candidate_ws is not websocket:
                     previous_session_id = candidate_id
                     previous_websocket = candidate_ws
+                elif candidate_ws is websocket:
+                    # Same connection re-registering (e.g. a client retry):
+                    # drop the old session's state so reverse websocket lookups
+                    # and the orphan sweep cannot misattribute this socket or
+                    # close it out from under the new session.
+                    await cls._cleanup_session_locked(candidate_id)
 
             session = await registry.register(
                 session_id,

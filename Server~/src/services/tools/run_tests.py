@@ -197,6 +197,9 @@ async def get_test_job(
 
     # If wait_timeout is specified, poll server-side until complete or timeout
     if wait_timeout and wait_timeout > 0:
+        # Clamp to a sane bound so a rogue caller cannot pin a 2s-interval
+        # polling loop against Unity for an arbitrary duration.
+        wait_timeout = min(wait_timeout, 600)
         deadline = asyncio.get_event_loop().time() + wait_timeout
         poll_interval = 2.0  # Poll Unity every 2 seconds
         

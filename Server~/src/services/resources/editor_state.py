@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 from typing import Any
 
 from fastmcp import Context
@@ -279,19 +280,25 @@ async def get_editor_state_for_instance(
     try:
         instance_id = unity_section.get("instance_id")
         if isinstance(instance_id, str) and instance_id.strip():
-            from services.resources.project_info import get_project_info_for_instance
+            # projectRoot is static for a running instance: only round-trip to
+            # Unity once to learn it, not on every editor_state poll.
+            if not external_changes_scanner.project_root_for(instance_id):
+                from services.resources.project_info import get_project_info_for_instance
 
-            proj_resp = await get_project_info_for_instance(ctx, unity_instance)
-            proj = proj_resp.model_dump() if hasattr(
-                proj_resp, "model_dump") else proj_resp
-            proj_data = proj.get("data") if isinstance(proj, dict) else None
-            project_root = proj_data.get("projectRoot") if isinstance(
-                proj_data, dict) else None
-            if isinstance(project_root, str) and project_root.strip():
-                external_changes_scanner.set_project_root(
-                    instance_id, project_root)
+                proj_resp = await get_project_info_for_instance(ctx, unity_instance)
+                proj = proj_resp.model_dump() if hasattr(
+                    proj_resp, "model_dump") else proj_resp
+                proj_data = proj.get("data") if isinstance(proj, dict) else None
+                project_root = proj_data.get("projectRoot") if isinstance(
+                    proj_data, dict) else None
+                if isinstance(project_root, str) and project_root.strip():
+                    external_changes_scanner.set_project_root(
+                        instance_id, project_root)
 
-            ext = external_changes_scanner.update_and_get(instance_id)
+            # The recursive mtime scan walks up to max_entries files; run it
+            # off the event loop so polling cannot stall unrelated requests.
+            ext = await asyncio.to_thread(
+                external_changes_scanner.update_and_get, instance_id)
 
             assets = state_v2.get("assets")
             if not isinstance(assets, dict):
