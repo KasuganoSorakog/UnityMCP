@@ -1,0 +1,330 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using MCPForUnity.Editor.Constants;
+using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services.Transport;
+using MCPForUnity.Editor.Windows;
+using UnityEditor;
+
+namespace MCPForUnity.Editor.Services
+{
+    /// <summary>
+    /// Records HTTP transport reload state without automatically reconnecting after reload.
+    /// </summary>
+    [InitializeOnLoad]
+    internal static class HttpBridgeReloadHandler
+    {
+        private static readonly SynchronizationContext EditorSynchronizationContext;
+
+        static HttpBridgeReloadHandler()
+        {
+            EditorSynchronizationContext = SynchronizationContext.Current;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+            AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
+        }
+
+        /// <summary>
+        /// Asset Import Worker 等批处理进程不得持有 MCP 连接：
+        /// 它们会用相同 project hash 注册并顶掉编辑器会话，导致命令路由错乱。
+        /// 设置 UNITY_MCP_ALLOW_BATCH 可强制放行（与 StdioBridgeHost 的守卫保持一致）。
+        /// </summary>
+        internal static bool BatchModeBlocked()
+        {
+            return UnityEngine.Application.isBatchMode &&
+                   string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("UNITY_MCP_ALLOW_BATCH"));
+        }
+
+        private static void OnBeforeAssemblyReload()
+        {
+            if (BatchModeBlocked())
+            {
+                return;
+            }
+
+            try
+            {
+                var transport = MCPServiceLocator.TransportManager;
+                bool shouldResume = transport.IsRunning(TransportMode.Http);
+
+                if (shouldResume)
+                {
+                    EditorPrefs.SetBool(EditorPrefKeys.ResumeHttpAfterReload, true);
+                    if (McpProjectSettings.GetAutoReconnect())
+                    {
+                        EditorPrefs.DeleteKey(EditorPrefKeys.ManualReconnectRequired);
+                    }
+                    else
+                    {
+                        EditorPrefs.SetBool(EditorPrefKeys.ManualReconnectRequired, true);
+                    }
+                }
+                else
+                {
+                    EditorPrefs.DeleteKey(EditorPrefKeys.ResumeHttpAfterReload);
+                }
+
+                if (shouldResume)
+                {
+                    var stopTask = transport.StopAsync(TransportMode.Http);
+                    // 域重载前有限同步等待旧连接关闭，避免新域注册时旧会话仍存活造成瞬时双会话。
+                    // StopAsync 内部全程 ConfigureAwait(false)，无主线程死锁风险；超时则放弃，由服务端顶替逻辑兜底。
+                    try { stopTask.Wait(TimeSpan.FromMilliseconds(750)); } catch { }
+                    stopTask.ContinueWith(t =>
+                    {
+                        if (t.IsFaulted && t.Exception != null)
+                        {
+                            McpLog.Warn($"Error stopping MCP bridge before reload: {t.Exception.GetBaseException().Message}");
+                        }
+                    }, TaskScheduler.Default);
+                }
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"Failed to evaluate HTTP bridge reload state: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 本工程 Session 是否已被同工程另一实例顶替（项目级标记，由 WebSocketTransportClient 写入）。
+        /// </summary>
+        internal static bool IsSuperseded()
+        {
+            try
+            {
+                return EditorPrefs.GetBool(EditorPrefKeys.SupersededPrefix + ProjectIdentityUtility.GetProjectHash(), false);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void OnAfterAssemblyReload()
+        {
+            if (BatchModeBlocked())
+            {
+                return;
+            }
+
+            if (IsSuperseded())
+            {
+                McpLog.Warn("本工程 Session 已被同一工程的另一个 Unity 实例顶替（同项目多开？），跳过域重载后的自动重连，请在 MCP 面板手动连接。");
+                return;
+            }
+
+            bool resume = false;
+            try
+            {
+                // Only resume HTTP if it is still the selected transport.
+                bool useHttp = McpProjectSettings.GetUseHttpTransport();
+                resume = useHttp && EditorPrefs.GetBool(EditorPrefKeys.ResumeHttpAfterReload, false);
+                if (resume)
+                {
+                    EditorPrefs.DeleteKey(EditorPrefKeys.ResumeHttpAfterReload);
+                }
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"Failed to read HTTP bridge reload flag: {ex.Message}");
+                resume = false;
+            }
+
+            if (!resume)
+            {
+                return;
+            }
+
+            if (!McpProjectSettings.GetAutoReconnect())
+            {
+                McpLog.Warn("HTTP MCP bridge stopped for domain reload; 自动重连未开启，请在 MCP 面板手动连接。");
+                return;
+            }
+
+            EditorPrefs.DeleteKey(EditorPrefKeys.ManualReconnectRequired);
+            _ = StartHttpAfterReloadAsync();
+        }
+
+        private static async Task StartHttpAfterReloadAsync()
+        {
+            try
+            {
+                bool started = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
+                if (!started)
+                {
+                    McpLog.Warn("HTTP MCP bridge 自动重连失败，请在 MCP 面板手动连接。");
+                    return;
+                }
+
+                RunOnEditorThread(MCPForUnityEditorWindow.RequestHealthVerification);
+            }
+            catch (Exception ex)
+            {
+                McpLog.Error($"HTTP MCP bridge 自动重连异常：{ex.Message}");
+            }
+        }
+
+        private static void RunOnEditorThread(Action action)
+        {
+            if (action == null)
+            {
+                return;
+            }
+
+            if (EditorSynchronizationContext != null)
+            {
+                EditorSynchronizationContext.Post(_ => action(), null);
+                return;
+            }
+
+            action();
+        }
+    }
+
+    [InitializeOnLoad]
+    internal static class CentralServerAutoConnect
+    {
+        private const int MaxAttempts = 30;
+        private const int InitialDelayMs = 1000;
+        private const int RetryDelayMs = 2000;
+
+        private static bool running;
+
+        static CentralServerAutoConnect()
+        {
+            EditorApplication.delayCall += () => _ = TryAutoConnectAsync();
+        }
+
+        private static async Task TryAutoConnectAsync()
+        {
+            if (HttpBridgeReloadHandler.BatchModeBlocked())
+            {
+                return;
+            }
+
+            // 在第一个 await 之前（主线程）检查顶替标记：被同工程另一实例顶替后不再自动连接，避免互相顶替死循环
+            if (HttpBridgeReloadHandler.IsSuperseded())
+            {
+                McpLog.Warn("UnityMCP 自动连接已跳过：本工程 Session 已被同工程另一实例顶替（同项目多开？），需在 MCP 面板手动连接。");
+                return;
+            }
+
+            if (running)
+            {
+                return;
+            }
+            running = true;
+
+            try
+            {
+                await Task.Delay(InitialDelayMs);
+
+                var settings = McpProjectSettings.Load();
+                if (!settings.CentralServerEnabled || !settings.CentralServerAutoStart || !settings.AutoConnect)
+                {
+                    return;
+                }
+
+                if (!settings.AutoReconnect && EditorPrefs.GetBool(EditorPrefKeys.ManualReconnectRequired, false))
+                {
+                    McpLog.Warn("UnityMCP 自动连接已跳过：上次连接因 reload/断线停止，请在 MCP 面板手动连接。");
+                    return;
+                }
+
+                if (!settings.UseHttpTransport || !string.Equals(settings.HttpTransportScope, "local", StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+                {
+                    if (!IsEditorReadyForAutoConnect())
+                    {
+                        await DelayBeforeRetryAsync(attempt);
+                        continue;
+                    }
+
+                    if (MCPServiceLocator.TransportManager.IsRunning(TransportMode.Http))
+                    {
+                        McpLog.Info("UnityMCP Session 已连接，跳过自动连接。");
+                        return;
+                    }
+
+                    bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning();
+                    if (!serverReady)
+                    {
+                        bool launchRequested = MCPServiceLocator.Server.StartLocalHttpServerQuiet();
+                        if (!launchRequested)
+                        {
+                            await DelayBeforeRetryAsync(attempt);
+                            continue;
+                        }
+
+                        serverReady = await WaitForServerReadyAsync();
+                    }
+
+                    if (!serverReady)
+                    {
+                        await DelayBeforeRetryAsync(attempt);
+                        continue;
+                    }
+
+                    bool connected = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
+                    if (connected)
+                    {
+                        McpLog.Info("UnityMCP 已在项目加载完成后自动连接 Session。");
+                        MCPForUnityEditorWindow.RequestHealthVerification();
+                        return;
+                    }
+
+                    await DelayBeforeRetryAsync(attempt);
+                }
+
+                McpLog.Warn("UnityMCP 自动连接超时：中心 Server 未就绪或 Session 建立失败。");
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"UnityMCP 自动连接失败：{ex.Message}");
+            }
+            finally
+            {
+                running = false;
+            }
+        }
+
+        private static bool IsEditorReadyForAutoConnect()
+        {
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                return false;
+            }
+
+            try
+            {
+                var pipeline = Type.GetType("UnityEditor.Compilation.CompilationPipeline, UnityEditor");
+                var prop = pipeline?.GetProperty("isCompiling", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (prop != null && (bool)prop.GetValue(null))
+                {
+                    return false;
+                }
+            }
+            catch { }
+
+            return true;
+        }
+
+        private static Task DelayBeforeRetryAsync(int attempt)
+        {
+            // 项目启动和 Domain Reload 可能持续数十秒，最后一次失败后无需继续等待。
+            return attempt < MaxAttempts
+                ? Task.Delay(RetryDelayMs)
+                : Task.CompletedTask;
+        }
+
+        private static async Task<bool> WaitForServerReadyAsync()
+        {
+            await Task.Yield();
+            return MCPServiceLocator.Server.IsLocalHttpServerRunning();
+        }
+    }
+}
