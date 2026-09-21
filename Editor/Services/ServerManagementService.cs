@@ -1338,21 +1338,18 @@ namespace MCPForUnity.Editor.Services
 
             string uvPath = BuildUvPathFromUvx(uvxPath);
 
+            // 无条件确保项目内服务端源码与包内 Server~ 一致（版本一致时秒回，零成本）：
+            // 首次接入自动部署、包升级自动同步、中断的半成品部署自愈都走这里。
+            // 注意：不能只在前置检查失败时才调用——前置检查不比版本，旧版本目录会让升级同步永远跳过。
+            if (!ServerDeploymentService.EnsureProjectLocalServer(out string deployMessage))
+            {
+                error = deployMessage;
+                return false;
+            }
+
             if (!AssetPathUtility.TryGetPrivateServerSource(out fromUrl, out error))
             {
-                // 首次启动（或包升级后版本不一致）时，自动从包内 Server~ 部署/同步服务端源码后重试。
-                if (ServerDeploymentService.EnsureProjectLocalServer(out string deployMessage))
-                {
-                    if (!AssetPathUtility.TryGetPrivateServerSource(out fromUrl, out error))
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    error = string.IsNullOrEmpty(deployMessage) ? error : $"{error}\n{deployMessage}";
-                    return false;
-                }
+                return false;
             }
 
             // 直接运行当前项目内的 Server 源码，避免用户目录镜像与跨电脑路径差异。

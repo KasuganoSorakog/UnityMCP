@@ -411,7 +411,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     await HandleRegisteredAsync(payload, token).ConfigureAwait(false);
                     break;
                 case "execute":
-                    await HandleExecuteAsync(payload, token).ConfigureAwait(false);
+                    // 命令在 Unity 主线程执行可能耗时数十秒：fire-and-forget 后台执行并自行回发结果，
+                    // 避免串行 await 阻塞接收循环，导致 ping/cancel/session_superseded 等轻量消息积压在 socket 缓冲区读不到。
+                    _ = Task.Run(() => ExecuteCommandInBackgroundAsync(payload, token), CancellationToken.None);
                     break;
                 case "ping":
                     await SendPongAsync(token).ConfigureAwait(false);
@@ -642,6 +644,58 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             };
 
             await SendJsonAsync(responsePayload, token).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// 后台执行服务端命令并回发结果（接收循环 fire-and-forget 调度，并发语义不变：
+        /// 命令仍由 <see cref="TransportCommandDispatcher"/> 排队后在 Unity 主线程串行执行）。
+        /// HandleExecuteAsync 内部已把命令异常转成 error 结果；这里兜底捕获剩余异常
+        /// （多为结果回发时连接已断开），尽量补发 error 结果，失败仅记日志，绝不静默吞掉。
+        /// </summary>
+        private async Task ExecuteCommandInBackgroundAsync(JObject payload, CancellationToken token)
+        {
+            string commandId = payload?.Value<string>("id");
+            try
+            {
+                await HandleExecuteAsync(payload, token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[WebSocket] 命令 {commandId} 执行/回发异常：{ex.Message}");
+                await TrySendErrorResultAsync(commandId, ex.Message).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// 尽力回发 error 结果。用 CancellationToken.None：连接令牌可能已取消，
+        /// 但 socket 仍开着时（如命令超时）补发仍可能成功；连接已断开则记日志放弃。
+        /// </summary>
+        private async Task TrySendErrorResultAsync(string commandId, string error)
+        {
+            if (string.IsNullOrEmpty(commandId))
+            {
+                return;
+            }
+
+            try
+            {
+                var payload = new JObject
+                {
+                    ["type"] = "command_result",
+                    ["id"] = commandId,
+                    ["result"] = new JObject
+                    {
+                        ["status"] = "error",
+                        ["error"] = error
+                    }
+                };
+
+                await SendJsonAsync(payload, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[WebSocket] 命令 {commandId} 的 error 结果回发失败（连接可能已断开）：{ex.Message}");
+            }
         }
 
         private async Task KeepAliveLoopAsync(CancellationToken token)

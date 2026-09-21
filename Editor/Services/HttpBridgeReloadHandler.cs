@@ -66,6 +66,10 @@ namespace MCPForUnity.Editor.Services
 
                 if (shouldResume)
                 {
+                    // 域重载前取消所有 pending 命令（对齐 StdioBridgeHost.Stop 的模式），
+                    // 避免旧命令在新域中继续执行或悬挂到超时
+                    try { TransportCommandDispatcher.CancelAllPending("domain_reload"); } catch { }
+
                     var stopTask = transport.StopAsync(TransportMode.Http);
                     // 域重载前有限同步等待旧连接关闭，避免新域注册时旧会话仍存活造成瞬时双会话。
                     // StopAsync 内部全程 ConfigureAwait(false)，无主线程死锁风险；超时则放弃，由服务端顶替逻辑兜底。
@@ -187,8 +191,12 @@ namespace MCPForUnity.Editor.Services
         private const int MaxAttempts = 30;
         private const int InitialDelayMs = 1000;
         private const int RetryDelayMs = 2000;
+        private const int ServerReadyPollMs = 500;
+        private const int ServerReadyTimeoutMs = 30000;
 
         private static bool running;
+        // 已拉起服务端进程、等待端口绑定中：此期间不再重复 spawn，避免多进程堆积抢 8080
+        private static bool serverLaunchPending;
 
         static CentralServerAutoConnect()
         {
@@ -253,14 +261,21 @@ namespace MCPForUnity.Editor.Services
                     bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning();
                     if (!serverReady)
                     {
-                        bool launchRequested = MCPServiceLocator.Server.StartLocalHttpServerQuiet();
-                        if (!launchRequested)
+                        if (!serverLaunchPending)
                         {
-                            await DelayBeforeRetryAsync(attempt);
-                            continue;
+                            bool launchRequested = MCPServiceLocator.Server.StartLocalHttpServerQuiet();
+                            if (!launchRequested)
+                            {
+                                await DelayBeforeRetryAsync(attempt);
+                                continue;
+                            }
+
+                            serverLaunchPending = true;
                         }
 
                         serverReady = await WaitForServerReadyAsync();
+                        // 本轮绑定等待结束（成功或超时）：清除标记，超时未就绪则下一轮重试允许重新拉起
+                        serverLaunchPending = false;
                     }
 
                     if (!serverReady)
@@ -323,7 +338,19 @@ namespace MCPForUnity.Editor.Services
 
         private static async Task<bool> WaitForServerReadyAsync()
         {
-            await Task.Yield();
+            // 进程拉起后端口绑定需要时间：轮询等待（每 500ms 一次、总计约 30s 上限）。
+            // await Task.Delay 为异步等待（与 DelayBeforeRetryAsync 一致），不阻塞主线程。
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            while (stopwatch.ElapsedMilliseconds < ServerReadyTimeoutMs)
+            {
+                if (MCPServiceLocator.Server.IsLocalHttpServerRunning())
+                {
+                    return true;
+                }
+
+                await Task.Delay(ServerReadyPollMs);
+            }
+
             return MCPServiceLocator.Server.IsLocalHttpServerRunning();
         }
     }

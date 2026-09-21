@@ -71,7 +71,8 @@ namespace MCPForUnity.Editor.Services
             if (File.Exists(projectPyproject))
             {
                 string projectVersion = ReadServerVersion(projectPyproject);
-                if (string.Equals(projectVersion, bundledVersion, StringComparison.Ordinal))
+                if (string.Equals(projectVersion, bundledVersion, StringComparison.Ordinal)
+                    && IsDeploymentComplete(projectPath))
                 {
                     // 已部署且版本一致，直接使用项目内服务端。
                     return true;
@@ -94,6 +95,19 @@ namespace MCPForUnity.Editor.Services
         }
 
         /// <summary>
+        /// Minimal integrity fingerprint: a deploy interrupted mid-copy (crash, disk
+        /// full, killed editor) can leave a version-matching but incomplete tree,
+        /// which would otherwise never self-heal because the versions compare equal.
+        /// </summary>
+        private static bool IsDeploymentComplete(string projectPath)
+        {
+            return File.Exists(Path.Combine(projectPath, "uv.lock"))
+                && File.Exists(Path.Combine(projectPath, "src", "main.py"))
+                && Directory.Exists(Path.Combine(projectPath, "src", "core"))
+                && Directory.Exists(Path.Combine(projectPath, "src", "transport"));
+        }
+
+        /// <summary>
         /// Mirrors bundled sources into the project directory, preserving .venv.
         /// Everything else under the target is deleted first so removed files cannot
         /// linger as ghost tools/resources (the server auto-discovers .py files).
@@ -101,6 +115,10 @@ namespace MCPForUnity.Editor.Services
         private static void SyncServerSources(string sourceRoot, string targetRoot)
         {
             Directory.CreateDirectory(targetRoot);
+
+            // Perforce 等版本管控下检出的文件带只读属性：同步前递归清除，
+            // 否则删除/覆盖目标文件会抛 IOException
+            ClearReadOnlyAttributes(targetRoot);
 
             foreach (string dir in Directory.GetDirectories(targetRoot))
             {
@@ -118,6 +136,74 @@ namespace MCPForUnity.Editor.Services
             }
 
             CopyDirectoryFiltered(sourceRoot, targetRoot);
+            WriteGitignoreIfMissing(targetRoot);
+        }
+
+        /// <summary>
+        /// Recursively clears the ReadOnly attribute on the target tree so synced-out
+        /// files (e.g. Perforce checkouts) can be deleted/overwritten without IOException.
+        /// </summary>
+        private static void ClearReadOnlyAttributes(string rootDir)
+        {
+            if (!Directory.Exists(rootDir))
+            {
+                return;
+            }
+
+            ClearReadOnlyAttributesRecursive(rootDir);
+        }
+
+        private static void ClearReadOnlyAttributesRecursive(string dir)
+        {
+            foreach (string file in Directory.GetFiles(dir))
+            {
+                var attributes = File.GetAttributes(file);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                {
+                    File.SetAttributes(file, attributes & ~FileAttributes.ReadOnly);
+                }
+            }
+
+            foreach (string subDir in Directory.GetDirectories(dir))
+            {
+                // 跳过 .venv 等保留目录：同步不会删除/覆盖它们，
+                // 遍历 venv 内上万文件只会徒增编辑器卡顿
+                if (IsExcluded(Path.GetFileName(subDir)))
+                {
+                    continue;
+                }
+
+                var attributes = File.GetAttributes(subDir);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                {
+                    File.SetAttributes(subDir, attributes & ~FileAttributes.ReadOnly);
+                }
+
+                ClearReadOnlyAttributesRecursive(subDir);
+            }
+        }
+
+        /// <summary>
+        /// The deployed server directory contains generated artifacts (.venv, __pycache__,
+        /// egg-info, build) that must not be committed: drop a .gitignore on first deploy.
+        /// An existing .gitignore is left untouched to respect project-specific rules.
+        /// </summary>
+        private static void WriteGitignoreIfMissing(string targetRoot)
+        {
+            string gitignorePath = Path.Combine(targetRoot, ".gitignore");
+            if (File.Exists(gitignorePath))
+            {
+                return;
+            }
+
+            try
+            {
+                File.WriteAllText(gitignorePath, ".venv/\n__pycache__/\n*.egg-info\nbuild/\n");
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"写入 {gitignorePath} 失败：{ex.Message}");
+            }
         }
 
         private static void CopyDirectoryFiltered(string sourceDir, string targetDir)

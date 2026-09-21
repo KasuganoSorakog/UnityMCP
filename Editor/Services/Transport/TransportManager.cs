@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Transport.Transports;
@@ -16,6 +17,8 @@ namespace MCPForUnity.Editor.Services.Transport
         private TransportState _stdioState = TransportState.Disconnected("stdio");
         private Func<IMcpTransportClient> _webSocketFactory;
         private Func<IMcpTransportClient> _stdioFactory;
+        private readonly object _startLock = new();
+        private readonly Dictionary<TransportMode, Task<bool>> _startTasks = new();
 
         public TransportManager()
         {
@@ -55,7 +58,35 @@ namespace MCPForUnity.Editor.Services.Transport
             };
         }
 
-        public async Task<bool> StartAsync(TransportMode mode)
+        public Task<bool> StartAsync(TransportMode mode)
+        {
+            // 并发合并：同一传输模式下重叠的 StartAsync（domain reload 恢复与启动自动连接可能双路并发）
+            // 复用进行中的启动任务，避免两条路径交错 connect 把连接状态（如 superseded 标记）写乱。
+            lock (_startLock)
+            {
+                if (_startTasks.TryGetValue(mode, out Task<bool> inFlight))
+                {
+                    return inFlight;
+                }
+
+                Task<bool> startTask = StartCoreAsync(mode);
+                _startTasks[mode] = startTask;
+                _ = startTask.ContinueWith(t =>
+                {
+                    lock (_startLock)
+                    {
+                        if (_startTasks.TryGetValue(mode, out Task<bool> current) && ReferenceEquals(current, t))
+                        {
+                            _startTasks.Remove(mode);
+                        }
+                    }
+                }, TaskScheduler.Default);
+
+                return startTask;
+            }
+        }
+
+        private async Task<bool> StartCoreAsync(TransportMode mode)
         {
             IMcpTransportClient client = GetOrCreateClient(mode);
 
