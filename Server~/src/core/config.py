@@ -42,9 +42,10 @@ class ServerConfig:
     port_registry_ttl: float = 5.0
 
     # Telemetry settings
-    telemetry_enabled: bool = True
-    # Align with telemetry.py default Cloud Run endpoint
-    telemetry_endpoint: str = "https://api-prod.coplay.dev/telemetry/events"
+    # Fork note (Sora Unity MCP): disabled by default — the upstream endpoint
+    # belongs to CoplayDev; this fork must not phone home to a third party.
+    telemetry_enabled: bool = False
+    telemetry_endpoint: str = ""
 
     def configure_logging(self) -> None:
         level = getattr(logging, self.log_level, logging.INFO)
