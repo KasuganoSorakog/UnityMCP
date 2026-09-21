@@ -62,6 +62,12 @@ namespace MCPForUnity.Editor.Tools
             try
             {
                 var suggestions = GetRuleBasedSuggestions(userInput, availableProperties);
+                // Cap unbounded growth: each unique AI trial-and-error input adds an entry.
+                // Full clear is safe here - this is a suggestion cache with no correctness dependency.
+                if (PropertySuggestionCache.Count >= MaxPropertySuggestionCacheEntries)
+                {
+                    PropertySuggestionCache.Clear();
+                }
                 PropertySuggestionCache[cacheKey] = suggestions;
                 return suggestions;
             }
@@ -72,6 +78,7 @@ namespace MCPForUnity.Editor.Tools
             }
         }
 
+        private const int MaxPropertySuggestionCacheEntries = 256;
         private static readonly Dictionary<string, List<string>> PropertySuggestionCache = new();
 
         /// <summary>

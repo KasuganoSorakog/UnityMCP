@@ -36,6 +36,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private static readonly TimeSpan DefaultKeepAliveInterval = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan RegistrationTimeout = TimeSpan.FromSeconds(10);
+        // ConnectAsync 无内置超时：服务端接受 TCP 但 WS 握手挂起时会无限等待，需独立超时兜底
+        private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(15);
         // 单条 WebSocket 消息的接收上限（对齐 legacy TCP 的 64MB）
         private const long MaxMessageBytes = 64L * 1024 * 1024;
 
@@ -211,13 +213,24 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _sessionId = null;
             _registrationCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+            // 独立连接超时：握手挂起时抛 OperationCanceledException，走"连接失败返回 false"，
+            // 避免 TransportManager 缓存的启动任务永久卡住；linked CTS 随作用域 Dispose
+            using var connectTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(connectionToken);
+            connectTimeoutCts.CancelAfter(ConnectTimeout);
             try
             {
-                await _socket.ConnectAsync(_endpointUri, connectionToken).ConfigureAwait(false);
+                await _socket.ConnectAsync(_endpointUri, connectTimeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!connectionToken.IsCancellationRequested)
+            {
+                McpLog.Error($"[WebSocket] Connection timed out after {ConnectTimeout.TotalSeconds:0} seconds");
+                await CleanupFailedConnectionAsync().ConfigureAwait(false);
+                return false;
             }
             catch (Exception ex)
             {
                 McpLog.Error($"[WebSocket] Connection failed: {ex.Message}");
+                await CleanupFailedConnectionAsync().ConfigureAwait(false);
                 return false;
             }
 
@@ -233,6 +246,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 if (completedTask != registrationTask)
                 {
                     McpLog.Error($"[WebSocket] Registration acknowledgement timed out after {RegistrationTimeout.TotalSeconds:0} seconds");
+                    await CleanupFailedConnectionAsync().ConfigureAwait(false);
                     return false;
                 }
 
@@ -241,10 +255,38 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             catch (Exception ex)
             {
                 McpLog.Error($"[WebSocket] Registration failed: {ex.Message}");
+                await CleanupFailedConnectionAsync().ConfigureAwait(false);
                 return false;
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// 连接/注册失败后的就地清理：停掉后台循环、关闭并释放当前 socket。
+        /// 任何失败路径都不留活 socket/活任务——否则残留的 ReceiveLoop 会在服务端
+        /// 断开这个未注册连接时走 HandleSocketClosureAsync 再触发一轮无效重连（无限 churn）。
+        /// </summary>
+        private async Task CleanupFailedConnectionAsync()
+        {
+            await StopConnectionLoopsAsync().ConfigureAwait(false);
+
+            if (_socket != null)
+            {
+                try
+                {
+                    if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
+                    {
+                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Connection failed", CancellationToken.None).ConfigureAwait(false);
+                    }
+                }
+                catch { }
+                finally
+                {
+                    _socket.Dispose();
+                    _socket = null;
+                }
+            }
         }
 
         /// <summary>
@@ -849,6 +891,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                         return;
                     }
                 }
+
+                // 放弃重连（重试耗尽/被顶替/自动重连被关闭）：完整清理残留，
+                // 避免僵尸连接在服务端断连时再触发一轮无效重连
+                await CleanupFailedConnectionAsync().ConfigureAwait(false);
 
                 if (!_superseded)
                 {

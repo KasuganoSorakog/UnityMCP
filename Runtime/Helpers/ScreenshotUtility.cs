@@ -99,13 +99,14 @@ namespace MCPForUnity.Runtime.Helpers
             RenderTexture prevRT = camera.targetTexture;
             RenderTexture prevActive = RenderTexture.active;
             var rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32);
+            Texture2D tex = null;
             try
             {
                 camera.targetTexture = rt;
                 camera.Render();
 
                 RenderTexture.active = rt;
-                var tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+                tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
                 tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
                 tex.Apply();
 
@@ -117,6 +118,8 @@ namespace MCPForUnity.Runtime.Helpers
                 camera.targetTexture = prevRT;
                 RenderTexture.active = prevActive;
                 RenderTexture.ReleaseTemporary(rt);
+                // Texture2D native pixel memory (tens of MB at 8k) is otherwise only freed by the GC finalizer
+                if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
             }
 
             string projectRoot = GetProjectRootPath();
