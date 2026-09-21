@@ -117,6 +117,10 @@ class PluginHub(WebSocketEndpoint):
     # command_id -> {"future": Future, "session_id": str}
     _pending: dict[str, dict[str, Any]] = {}
     _lock: asyncio.Lock | None = None
+    # Serializes _handle_register so concurrent re-registrations of the same
+    # project hash cannot interleave register/connection-insert and both
+    # believe they own the hash.
+    _register_lock: asyncio.Lock | None = None
     _loop: asyncio.AbstractEventLoop | None = None
     _scheduler: InstanceCommandScheduler | None = None
     _sweeper_task: asyncio.Task | None = None
@@ -131,6 +135,7 @@ class PluginHub(WebSocketEndpoint):
         cls._loop = loop or asyncio.get_running_loop()
         # Ensure coordination primitives are bound to the configured loop
         cls._lock = asyncio.Lock()
+        cls._register_lock = asyncio.Lock()
         cls._scheduler = InstanceCommandScheduler()
 
     @classmethod
@@ -138,6 +143,7 @@ class PluginHub(WebSocketEndpoint):
         return (
             cls._registry is not None
             and cls._lock is not None
+            and cls._register_lock is not None
             and cls._scheduler is not None
         )
 
@@ -243,7 +249,17 @@ class PluginHub(WebSocketEndpoint):
     # ------------------------------------------------------------------
     @classmethod
     async def send_command(cls, session_id: str, command_type: str, params: dict[str, Any]) -> dict[str, Any]:
-        websocket = await cls._get_connection(session_id)
+        try:
+            websocket = await cls._get_connection(session_id)
+        except PluginDisconnectedError as exc:
+            return classified_error_response(
+                code="unity_session_disconnected",
+                category="session",
+                error=f"{exc}; Unity session is reconnecting",
+                retryable=True,
+                retry_after_ms=2000,
+                hint="retry",
+            )
         command_id = str(uuid.uuid4())
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         # Compute a per-command timeout:
@@ -307,7 +323,17 @@ class PluginHub(WebSocketEndpoint):
                 # If send fails (socket already closing), fail the future so callers don't hang.
                 if not future.done():
                     future.set_exception(exc)
-                raise
+                return classified_error_response(
+                    code="unity_session_disconnected",
+                    category="session",
+                    error=(
+                        f"Failed to send '{command_type}' to Unity ({exc}); "
+                        "session may be reconnecting"
+                    ),
+                    retryable=True,
+                    retry_after_ms=2000,
+                    hint="retry",
+                )
             try:
                 # Shield the future so that after the first timeout it stays
                 # alive and can still receive the plugin's late acknowledgement
@@ -611,7 +637,8 @@ class PluginHub(WebSocketEndpoint):
         cls = type(self)
         registry = cls._registry
         lock = cls._lock
-        if registry is None or lock is None:
+        register_lock = cls._register_lock
+        if registry is None or lock is None or register_lock is None:
             await websocket.close(code=1011)
             raise RuntimeError("PluginHub not configured")
 
@@ -626,30 +653,56 @@ class PluginHub(WebSocketEndpoint):
 
         session_id = str(uuid.uuid4())
 
-        # If a previous (still-connected) session claims the same project hash,
-        # notify and evict it explicitly instead of silently replacing it.
-        await cls._supersede_previous_session(
-            project_hash=project_hash,
-            project_name=project_name,
-            current_websocket=websocket,
-        )
+        # Serialize the whole lookup/register/insert/notify sequence: two
+        # editors reconnecting the same project hash concurrently must not
+        # interleave, or both ends can believe they own the hash and keep
+        # superseding each other.
+        previous_session_id: str | None = None
+        previous_websocket: WebSocket | None = None
+        async with register_lock:
+            candidate_id = await registry.get_session_id_by_hash(project_hash)
+            if candidate_id:
+                async with lock:
+                    candidate_ws = cls._connections.get(candidate_id)
+                if candidate_ws is not None and candidate_ws is not websocket:
+                    previous_session_id = candidate_id
+                    previous_websocket = candidate_ws
 
-        # Inform the plugin of its assigned session ID
-        response = RegisteredMessage(session_id=session_id)
-        await websocket.send_json(response.model_dump())
+            session = await registry.register(
+                session_id,
+                project_name,
+                project_hash,
+                unity_version,
+                project_path=payload.project_path,
+                package_version=payload.package_version,
+                current_scene=payload.current_scene,
+                capabilities_version=payload.capabilities_version,
+            )
+            async with lock:
+                cls._connections[session.session_id] = websocket
 
-        session = await registry.register(
-            session_id,
-            project_name,
-            project_hash,
-            unity_version,
-            project_path=payload.project_path,
-            package_version=payload.package_version,
-            current_scene=payload.current_scene,
-            capabilities_version=payload.capabilities_version,
-        )
-        async with lock:
-            cls._connections[session.session_id] = websocket
+            # Inform the plugin of its assigned session ID. If the socket is
+            # already dying, roll back so no orphaned session/connection stays.
+            response = RegisteredMessage(session_id=session_id)
+            try:
+                await websocket.send_json(response.model_dump())
+            except Exception:
+                await cls._cleanup_session_locked(session_id)
+                try:
+                    await websocket.close(code=1011)
+                except Exception:
+                    pass
+                raise
+
+        # Evict the previous connection only after the new session is fully
+        # registered, so the project never has zero usable sessions.
+        if previous_session_id is not None and previous_websocket is not None:
+            await cls._evict_superseded_session(
+                project_hash=project_hash,
+                project_name=project_name,
+                previous_session_id=previous_session_id,
+                previous_websocket=previous_websocket,
+            )
         logger.info(f"Plugin registered: {project_name} ({project_hash})")
 
     async def _handle_register_tools(self, websocket: WebSocket, payload: RegisterToolsMessage) -> None:
@@ -731,29 +784,21 @@ class PluginHub(WebSocketEndpoint):
         await registry.touch(source_session_id)
 
     @classmethod
-    async def _supersede_previous_session(
+    async def _evict_superseded_session(
         cls,
         *,
         project_hash: str,
         project_name: str,
-        current_websocket: WebSocket,
+        previous_session_id: str,
+        previous_websocket: WebSocket,
     ) -> None:
-        """Evict a still-connected previous session for the same project hash."""
-        registry = cls._registry
-        lock = cls._lock
-        if registry is None or lock is None:
-            return
+        """Notify and tear down a still-connected previous session that has
+        been superseded by a new registration for the same project hash.
 
-        previous_session_id = await registry.get_session_id_by_hash(project_hash)
-        if not previous_session_id:
-            return
-        async with lock:
-            previous_websocket = cls._connections.get(previous_session_id)
-        if previous_websocket is None or previous_websocket is current_websocket:
-            # No live connection to evict; registry.register replaces the stale
-            # record on its own.
-            return
-
+        Runs after the new session is fully registered; ``registry.register``
+        has already dropped the old session record, so the cleanup below only
+        clears the connection, in-flight commands and scheduler state.
+        """
         logger.info(
             "Project hash %s re-registered by a new connection; superseding session %s",
             project_hash,
@@ -784,7 +829,6 @@ class PluginHub(WebSocketEndpoint):
                 previous_session_id,
                 exc_info=True,
             )
-        # Must run before registry.register(), which drops the old session record.
         await cls._cleanup_session_locked(previous_session_id)
 
     # ------------------------------------------------------------------
@@ -856,6 +900,11 @@ class PluginHub(WebSocketEndpoint):
         evicted = 0
         for session in stale_sessions:
             session_id = session.session_id
+            # Re-check before touching the connection: the
+            # list_stale_sessions() snapshot takes time, and a pong arriving
+            # in that window must save the session from eviction.
+            if not await cls._session_still_stale(session_id, threshold):
+                continue
             lock = cls._lock
             websocket = None
             if lock is not None:
@@ -871,9 +920,9 @@ class PluginHub(WebSocketEndpoint):
                     )
                 except Exception:
                     pass
-            # Re-check right before cleanup: the list_stale_sessions() snapshot
-            # and the bounded close() both take time, and a pong arriving in
-            # that window must save the session from eviction.
+            # Re-check once more before destroying the registry record: the
+            # bounded close() also takes time, and a pong arriving during the
+            # close must still save the session.
             if not await cls._session_still_stale(session_id, threshold):
                 continue
             logger.info(
@@ -884,6 +933,29 @@ class PluginHub(WebSocketEndpoint):
             )
             await cls._cleanup_session_locked(session_id)
             evicted += 1
+
+        # Defense in depth: connections whose session is no longer in the
+        # registry (e.g. a supersede interrupted mid-flight) can never serve
+        # commands; close and drop them.
+        lock = cls._lock
+        if lock is not None:
+            async with lock:
+                connected = dict(cls._connections)
+            for session_id, websocket in connected.items():
+                if await registry.get_session(session_id) is not None:
+                    continue
+                logger.warning(
+                    "Closing orphaned plugin connection %s (no registry entry)",
+                    session_id,
+                )
+                try:
+                    await asyncio.wait_for(
+                        websocket.close(code=cls.CLOSE_CODE_STALE_SESSION),
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
+                await cls._cleanup_session_locked(session_id)
         return evicted
 
     @classmethod
@@ -922,7 +994,10 @@ class PluginHub(WebSocketEndpoint):
         async with lock:
             websocket = cls._connections.get(session_id)
         if websocket is None:
-            raise RuntimeError(f"Plugin session {session_id} not connected")
+            raise PluginDisconnectedError(
+                f"Unity plugin session {session_id} is not connected "
+                "(disconnected or still reconnecting)"
+            )
         return websocket
 
     # ------------------------------------------------------------------

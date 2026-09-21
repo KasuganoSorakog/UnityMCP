@@ -488,7 +488,15 @@ Examples:
             "UNITY_MCP_HTTP_PORT") else None) or parsed_url.port or 8080
         _warn_if_remote_host(host)
         logger.info(f"Starting FastMCP with HTTP transport on {host}:{port}")
-        mcp.run(transport=transport, host=host, port=port)
+        # Large hierarchy dumps and screenshots can exceed uvicorn's default
+        # 16MB websocket frame limit, which would kill the plugin connection
+        # with a 1009 close. Raise the cap for the local trusted link.
+        mcp.run(
+            transport=transport,
+            host=host,
+            port=port,
+            uvicorn_config={"ws_max_size": 64 * 1024 * 1024},
+        )
     else:
         # Use stdio transport for traditional MCP
         logger.info("Starting FastMCP with stdio transport")

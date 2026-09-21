@@ -11,7 +11,7 @@ from typing import Any
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-from transport.plugin_hub import PluginHub
+from transport.plugin_hub import PluginHub, PluginDisconnectedError
 
 logger = logging.getLogger("mcp-for-unity-server")
 
@@ -454,13 +454,21 @@ class UnityInstanceMiddleware(Middleware):
             except Exception as exc:
                 if isinstance(exc, (SystemExit, KeyboardInterrupt)):
                     raise
-                logger.debug(
-                    "Stored active Unity instance %s is not currently reachable (%s); retrying auto-select",
+                # Fork fix (multi-project safety): a stored selection that is
+                # briefly unreachable (domain reload, sweeper grace window) must
+                # NOT be cleared and re-routed to whatever project happens to be
+                # the only one online — that would silently execute mutation
+                # commands on the WRONG project and persist the wrong selection.
+                # Keep the selection and fail this request as retryable instead.
+                logger.info(
+                    "Stored active Unity instance %s is temporarily unreachable (%s); keeping selection and failing request as retryable",
                     active_instance,
                     type(exc).__name__,
                 )
-                self.clear_active_instance(ctx)
-                active_instance = None
+                raise PluginDisconnectedError(
+                    f"Unity instance '{active_instance}' is temporarily unreachable "
+                    "(likely reconnecting); stored selection kept — retry shortly."
+                ) from exc
         if not active_instance:
             active_instance = await self._maybe_autoselect_instance(ctx)
         if active_instance:

@@ -29,7 +29,12 @@ class PluginHub:
         return False
 
 
+class PluginDisconnectedError(RuntimeError):
+    pass
+
+
 plugin_hub_module.PluginHub = PluginHub
+plugin_hub_module.PluginDisconnectedError = PluginDisconnectedError
 sys.modules["transport.plugin_hub"] = plugin_hub_module
 
 from transport.unity_instance_middleware import (

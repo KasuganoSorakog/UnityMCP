@@ -37,7 +37,12 @@ class PluginHub:
         raise RuntimeError("not connected")
 
 
+class PluginDisconnectedError(RuntimeError):
+    pass
+
+
 plugin_hub_module.PluginHub = PluginHub
+plugin_hub_module.PluginDisconnectedError = PluginDisconnectedError
 sys.modules["transport.plugin_hub"] = plugin_hub_module
 
 import transport.unity_instance_middleware as unity_instance_middleware
@@ -166,7 +171,7 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
             middleware.get_active_instance(contexts[0]), "Project@hash-0")
         self.assertIsNone(middleware.get_active_instance(contexts[1]))
 
-    def test_unreachable_active_instance_is_cleared_before_autoselect(self):
+    def test_unreachable_active_instance_raises_retryable_and_keeps_selection(self):
         class ContextState(SimpleNamespace):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -181,7 +186,7 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
         async def run_test():
             middleware = UnityInstanceMiddleware()
-            # The clear-on-unreachable path only applies to HTTP transport.
+            # The unreachable guard only applies to HTTP transport.
             middleware._is_http_transport = lambda: True
             ctx = ContextState(
                 client_id="client-a",
@@ -193,12 +198,18 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
             unity_instance_middleware.PluginHub = PluginHub
             PluginHub.configured = True
             try:
-                await middleware._inject_unity_instance(MiddlewareContext(ctx))
+                with self.assertRaises(unity_instance_middleware.PluginDisconnectedError):
+                    await middleware._inject_unity_instance(MiddlewareContext(ctx))
             finally:
                 PluginHub.configured = False
                 unity_instance_middleware.PluginHub = old_plugin_hub
 
-            self.assertIsNone(middleware.get_active_instance(ctx))
+            # Multi-project safety: a transient unreachable window (domain reload,
+            # sweeper grace) must NOT clear the selection and re-route to whatever
+            # project is the only one online. The request fails as retryable and
+            # the stored selection survives.
+            self.assertEqual(
+                middleware.get_active_instance(ctx), "ProjectA@aaa111")
             self.assertNotIn("unity_instance", ctx.state)
 
         asyncio.run(run_test())
