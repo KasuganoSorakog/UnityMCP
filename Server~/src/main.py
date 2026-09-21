@@ -96,16 +96,6 @@ for noisy in ("httpx", "urllib3", "mcp.server.lowlevel.server"):
     except Exception:
         pass
 
-# Import telemetry only after logging is configured to ensure its logs use stderr and proper levels
-# Ensure a slightly higher telemetry timeout unless explicitly overridden by env
-try:
-
-    # Ensure generous timeout unless explicitly overridden by env
-    if not os.environ.get("UNITY_MCP_TELEMETRY_TIMEOUT"):
-        os.environ["UNITY_MCP_TELEMETRY_TIMEOUT"] = "5.0"
-except Exception:
-    pass
-
 # Global connection pool
 _unity_connection_pool: UnityConnectionPool | None = None
 _plugin_registry: PluginRegistry | None = None
@@ -363,7 +353,6 @@ def main():
 Environment Variables:
   UNITY_MCP_DEFAULT_INSTANCE   Default Unity instance to target (project name, hash, or 'Name@hash')
   UNITY_MCP_SKIP_STARTUP_CONNECT   Skip initial Unity connection attempt (set to 1/true/yes/on)
-  UNITY_MCP_TELEMETRY_ENABLED   Enable telemetry (set to 1/true/yes/on)
   UNITY_MCP_TRANSPORT   Transport protocol: stdio or http (default: stdio)
   UNITY_MCP_HTTP_URL   HTTP server URL (default: http://localhost:8080)
   UNITY_MCP_HTTP_HOST   HTTP server host (overrides URL host)

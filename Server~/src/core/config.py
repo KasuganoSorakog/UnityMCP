@@ -41,12 +41,6 @@ class ServerConfig:
     # Port discovery cache
     port_registry_ttl: float = 5.0
 
-    # Telemetry settings
-    # Fork note (Sora Unity MCP): disabled by default — the upstream endpoint
-    # belongs to CoplayDev; this fork must not phone home to a third party.
-    telemetry_enabled: bool = False
-    telemetry_endpoint: str = ""
-
     def configure_logging(self) -> None:
         level = getattr(logging, self.log_level, logging.INFO)
         logging.basicConfig(level=level, format=self.log_format)

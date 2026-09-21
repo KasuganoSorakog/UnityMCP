@@ -5,33 +5,28 @@ Inspired by Onyx's telemetry implementation with Unity-specific adaptations
 Fire-and-forget telemetry sender with a single background worker.
 - No context/thread-local propagation to avoid re-entrancy into tool resolution.
 - Small network timeouts to prevent stalls.
+
+Fork note (Sora Unity MCP): all outbound telemetry has been physically removed.
+The upstream endpoint belonged to CoplayDev; this fork never phones home.
+The public API (record_*, is_telemetry_enabled, get_package_version) is kept
+as no-op shims for import compatibility; `enabled` is hard-coded to False.
 """
 
 import contextlib
 from dataclasses import dataclass
 from enum import Enum
-from importlib import import_module, metadata
+from importlib import metadata
 import json
 import logging
 import os
 from pathlib import Path
-import platform
 import queue
-import sys
 import threading
 import time
 from typing import Any
-from urllib.parse import urlparse
 import uuid
 
 import tomli
-
-try:
-    import httpx
-    HAS_HTTPX = True
-except ImportError:
-    httpx = None  # type: ignore
-    HAS_HTTPX = False
 
 logger = logging.getLogger("unity-mcp-telemetry")
 PACKAGE_NAME = "mcpforunityserver"
@@ -80,9 +75,6 @@ def get_package_version() -> str:
             return "unknown"
 
 
-MCP_VERSION = get_package_version()
-
-
 class RecordType(str, Enum):
     """Types of telemetry records we collect"""
     VERSION = "version"
@@ -119,82 +111,27 @@ class TelemetryRecord:
 
 
 class TelemetryConfig:
-    """Telemetry configuration"""
+    """Telemetry configuration.
+
+    Fork note (Sora Unity MCP): outbound telemetry was removed entirely, so
+    `enabled` is hard-coded to False and there is no endpoint configuration.
+    The local-only fields below are kept because record_*() and the milestone
+    bookkeeping reference them.
+    """
 
     def __init__(self):
-        """
-        Prefer config file, then allow env overrides
-        """
-        server_config = None
-        for modname in (
-            # Prefer plain module to respect test-time overrides and sys.path injection
-            "src.core.config",
-            "config",
-            "src.config",
-            "Server.config",
-        ):
-            try:
-                mod = import_module(modname)
-                server_config = getattr(mod, "config", None)
-                if server_config is not None:
-                    break
-            except Exception:
-                continue
-
-        # Determine enabled flag: config -> env DISABLE_* opt-out
-        cfg_enabled = True if server_config is None else bool(
-            getattr(server_config, "telemetry_enabled", True))
-        self.enabled = cfg_enabled and not self._is_disabled()
-
-        # Telemetry endpoint (Cloud Run default; override via env)
-        cfg_default = None if server_config is None else getattr(
-            server_config, "telemetry_endpoint", None)
-        default_ep = cfg_default or "https://api-prod.coplay.dev/telemetry/events"
-        self.default_endpoint = default_ep
-        # Prefer config default; allow explicit env override only when set
-        env_ep = os.environ.get("UNITY_MCP_TELEMETRY_ENDPOINT")
-        if env_ep is not None and env_ep != "":
-            self.endpoint = self._validated_endpoint(env_ep, default_ep)
-        else:
-            # Validate config-provided default as well to enforce scheme/host rules
-            self.endpoint = self._validated_endpoint(default_ep, default_ep)
-        try:
-            logger.info(
-                f"Telemetry configured: endpoint={self.endpoint} (default={default_ep}), timeout_env={os.environ.get('UNITY_MCP_TELEMETRY_TIMEOUT') or '<unset>'}")
-        except Exception:
-            pass
+        self.enabled = False
+        self.endpoint = None
+        self.default_endpoint = None
+        self.timeout = 0.0
 
         # Local storage for UUID and milestones
         self.data_dir = self._get_data_directory()
         self.uuid_file = self.data_dir / "customer_uuid.txt"
         self.milestones_file = self.data_dir / "milestones.json"
 
-        # Request timeout (small, fail fast). Override with UNITY_MCP_TELEMETRY_TIMEOUT
-        try:
-            self.timeout = float(os.environ.get(
-                "UNITY_MCP_TELEMETRY_TIMEOUT", "1.5"))
-        except Exception:
-            self.timeout = 1.5
-        try:
-            logger.info(f"Telemetry timeout={self.timeout:.2f}s")
-        except Exception:
-            pass
-
         # Session tracking
         self.session_id = str(uuid.uuid4())
-
-    def _is_disabled(self) -> bool:
-        """Check if telemetry is disabled via environment variables"""
-        disable_vars = [
-            "DISABLE_TELEMETRY",
-            "UNITY_MCP_DISABLE_TELEMETRY",
-            "MCP_DISABLE_TELEMETRY"
-        ]
-
-        for var in disable_vars:
-            if os.environ.get(var, "").lower() in ("true", "1", "yes", "on"):
-                return True
-        return False
 
     def _get_data_directory(self) -> Path:
         """Get directory for storing telemetry data"""
@@ -213,30 +150,6 @@ class TelemetryConfig:
         data_dir = base_dir / 'UnityMCP'
         data_dir.mkdir(parents=True, exist_ok=True)
         return data_dir
-
-    def _validated_endpoint(self, candidate: str, fallback: str) -> str:
-        """Validate telemetry endpoint URL scheme; allow only http/https.
-        Falls back to the provided default on error.
-        """
-        try:
-            parsed = urlparse(candidate)
-            if parsed.scheme not in ("https", "http"):
-                raise ValueError(f"Unsupported scheme: {parsed.scheme}")
-            # Basic sanity: require network location and path
-            if not parsed.netloc:
-                raise ValueError("Missing netloc in endpoint")
-            # Reject localhost/loopback endpoints in production to avoid accidental local overrides
-            host = parsed.hostname or ""
-            if host in ("localhost", "127.0.0.1", "::1"):
-                raise ValueError(
-                    "Localhost endpoints are not allowed for telemetry")
-            return candidate
-        except Exception as e:
-            logger.debug(
-                f"Invalid telemetry endpoint '{candidate}', using default. Error: {e}",
-                exc_info=True,
-            )
-            return fallback
 
 
 class TelemetryCollector:
@@ -330,8 +243,6 @@ class TelemetryCollector:
         if not self.config.enabled:
             return
 
-        # Allow fallback sender when httpx is unavailable (no early return)
-
         record = TelemetryRecord(
             record_type=record_type,
             timestamp=time.time(),
@@ -361,71 +272,11 @@ class TelemetryCollector:
                     self._queue.task_done()
 
     def _send_telemetry(self, record: TelemetryRecord):
-        """Send telemetry data to endpoint"""
-        try:
-            # System fingerprint (top-level remains concise; details stored in data JSON)
-            _platform = platform.system()          # 'Darwin' | 'Linux' | 'Windows'
-            _source = sys.platform                 # 'darwin' | 'linux' | 'win32'
-            _platform_detail = f"{_platform} {platform.release()} ({platform.machine()})"
-            _python_version = platform.python_version()
-
-            # Enrich data JSON so BigQuery stores detailed fields without schema change
-            enriched_data = dict(record.data or {})
-            enriched_data.setdefault("platform_detail", _platform_detail)
-            enriched_data.setdefault("python_version", _python_version)
-
-            payload = {
-                "record": record.record_type.value,
-                "timestamp": record.timestamp,
-                "customer_uuid": record.customer_uuid,
-                "session_id": record.session_id,
-                "data": enriched_data,
-                "version": MCP_VERSION,
-                "platform": _platform,
-                "source": _source,
-            }
-
-            if record.milestone:
-                payload["milestone"] = record.milestone.value
-
-            # Prefer httpx when available; otherwise fall back to urllib
-            if httpx:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    # Re-validate endpoint at send time to handle dynamic changes
-                    endpoint = self.config._validated_endpoint(
-                        self.config.endpoint, self.config.default_endpoint)
-                    response = client.post(endpoint, json=payload)
-                    if 200 <= response.status_code < 300:
-                        logger.debug(f"Telemetry sent: {record.record_type}")
-                    else:
-                        logger.warning(
-                            f"Telemetry failed: HTTP {response.status_code}")
-            else:
-                import urllib.request
-                import urllib.error
-                data_bytes = json.dumps(payload).encode("utf-8")
-                endpoint = self.config._validated_endpoint(
-                    self.config.endpoint, self.config.default_endpoint)
-                req = urllib.request.Request(
-                    endpoint,
-                    data=data_bytes,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
-                        if 200 <= resp.getcode() < 300:
-                            logger.debug(
-                                f"Telemetry sent (urllib): {record.record_type}")
-                        else:
-                            logger.warning(
-                                f"Telemetry failed (urllib): HTTP {resp.getcode()}")
-                except urllib.error.URLError as ue:
-                    logger.warning(f"Telemetry send failed (urllib): {ue}")
-
-        except Exception as e:
-            # Never let telemetry errors interfere with app functionality
-            logger.debug(f"Telemetry send failed: {e}")
+        """No-op: outbound telemetry has been physically removed in this fork
+        (the upstream endpoint belonged to CoplayDev). Kept so the background
+        worker loop remains structurally intact.
+        """
+        return
 
 
 # Global telemetry instance

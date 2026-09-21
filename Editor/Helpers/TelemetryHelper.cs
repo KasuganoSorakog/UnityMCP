@@ -18,39 +18,12 @@ namespace MCPForUnity.Editor.Helpers
         private static Action<Dictionary<string, object>> s_sender;
 
         /// <summary>
-        /// Check if telemetry is enabled (can be disabled via Environment Variable or EditorPrefs)
+        /// Telemetry is permanently disabled in this fork (Sora Unity MCP):
+        /// the upstream pipeline reported events to CoplayDev servers.
+        /// IsEnabled always returns false so every RecordEvent call short-circuits
+        /// to a no-op. The API is kept for compatibility with existing call sites.
         /// </summary>
-        public static bool IsEnabled
-        {
-            get
-            {
-                // Check environment variables first
-                var envDisable = Environment.GetEnvironmentVariable("DISABLE_TELEMETRY");
-                if (!string.IsNullOrEmpty(envDisable) &&
-                    (envDisable.ToLower() == "true" || envDisable == "1"))
-                {
-                    return false;
-                }
-
-                var unityMcpDisable = Environment.GetEnvironmentVariable("UNITY_MCP_DISABLE_TELEMETRY");
-                if (!string.IsNullOrEmpty(unityMcpDisable) &&
-                    (unityMcpDisable.ToLower() == "true" || unityMcpDisable == "1"))
-                {
-                    return false;
-                }
-
-                // Honor protocol-wide opt-out as well
-                var mcpDisable = Environment.GetEnvironmentVariable("MCP_DISABLE_TELEMETRY");
-                if (!string.IsNullOrEmpty(mcpDisable) &&
-                    (mcpDisable.Equals("true", StringComparison.OrdinalIgnoreCase) || mcpDisable == "1"))
-                {
-                    return false;
-                }
-
-                // Check EditorPrefs
-                return !UnityEditor.EditorPrefs.GetBool(TELEMETRY_DISABLED_KEY, false);
-            }
-        }
+        public static bool IsEnabled => false;
 
         /// <summary>
         /// Get or generate customer UUID for anonymous tracking
