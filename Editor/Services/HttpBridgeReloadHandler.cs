@@ -153,6 +153,17 @@ namespace MCPForUnity.Editor.Services
         {
             try
             {
+                // 包升级触发的是域重载而非冷启动：恢复路径必须先做版本判定。
+                // 否则旧服务端会被立即重连，CentralServerAutoConnect 的版本判定会被"会话已连接"
+                // 早返回永久挡死（Editor.log 实证：三次升级版本日志零出现，服务端停在旧版数小时）。
+                // allowLaunch=false：Server 未运行时不主动拉起（尊重 CentralServerAutoStart 设置），
+                // 但"运行中 + 本项目启动 + 版本明确过旧"的停旧起新仍会执行——那是升级自愈，不是冷启动。
+                var settings = McpProjectSettings.Load();
+                if (settings.CentralServerEnabled && settings.CentralServerAutoStart)
+                {
+                    await CentralServerAutoConnect.EnsureServerReadyWithVersionCheckAsync(allowLaunch: false);
+                }
+
                 bool started = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
                 if (!started)
                 {
@@ -256,39 +267,8 @@ namespace MCPForUnity.Editor.Services
                         return;
                     }
 
-                    bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning();
-                    if (serverReady)
-                    {
-                        var versionCheck = await Task.Run(() => MCPServiceLocator.Server.CheckRunningServerVersion());
-                        if (versionCheck == ServerVersionCheck.Mismatch
-                            && await Task.Run(() => MCPServiceLocator.Server.IsRunningServerOwnedByThisProject()))
-                        {
-                            // 本项目启动的 Server 版本明确过旧：置为未就绪，进入下方 launch 分支停旧起新
-                            serverReady = false;
-                        }
-                        else if (versionCheck == ServerVersionCheck.Mismatch)
-                        {
-                            // 非本项目启动：不杀（中心 Server 多项目共享，滚动升级期版本偏斜属常态）
-                            McpLog.Warn("中心 MCP HTTP Server 由其他项目启动且版本不一致，保留现有 Server（服务端会继续服务并自报版本偏斜）；如需统一请从启动它的项目升级或手动重启。");
-                        }
-                        // Unknown（探针失败/未就绪）：保持 serverReady=true，让后续连接/重试等它就绪，不进停杀路径
-                    }
-
-                    if (!serverReady)
-                    {
-                        // 未运行（或本项目启动的版本过旧 Server）时拉起；StartLocalHttpServerQuiet 内部
-                        // 会先停掉过旧 Server 再启动，防重入由其自身的端口检查承担。
-                        // 探针/停杀/部署/uv 全为阻塞调用，放线程池执行避免卡主线程。
-                        bool launchRequested = await Task.Run(() => MCPServiceLocator.Server.StartLocalHttpServerQuiet());
-                        if (!launchRequested)
-                        {
-                            await DelayBeforeRetryAsync(attempt);
-                            continue;
-                        }
-
-                        serverReady = await WaitForServerReadyAsync();
-                    }
-
+                    // 三态版本判定 + 必要时停旧起新 + 等待就绪（与域重载恢复路径共用同一套逻辑）。
+                    bool serverReady = await EnsureServerReadyWithVersionCheckAsync(allowLaunch: true);
                     if (!serverReady)
                     {
                         await DelayBeforeRetryAsync(attempt);
@@ -316,6 +296,53 @@ namespace MCPForUnity.Editor.Services
             {
                 running = false;
             }
+        }
+
+        /// <summary>
+        /// 三态版本判定 + 必要时停旧起新 + 等待就绪，供自动连接循环与域重载恢复路径共用。
+        /// allowLaunch=false 时不在"Server 未运行"的情况下主动拉起（尊重手动管理模式），
+        /// 但"运行中 + 本项目启动 + 版本明确过旧"的停旧起新仍执行（升级自愈，非冷启动）。
+        /// 返回 true 表示 Server 可用（含"非本项目启动但复用"与"Unknown 等待就绪"的情形）。
+        /// </summary>
+        internal static async Task<bool> EnsureServerReadyWithVersionCheckAsync(bool allowLaunch)
+        {
+            bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning();
+            if (serverReady)
+            {
+                var versionCheck = await Task.Run(() => MCPServiceLocator.Server.CheckRunningServerVersion());
+                if (versionCheck == ServerVersionCheck.Mismatch
+                    && await Task.Run(() => MCPServiceLocator.Server.IsRunningServerOwnedByThisProject()))
+                {
+                    // 本项目启动的 Server 版本明确过旧：置为未就绪，进入下方 launch 分支停旧起新
+                    serverReady = false;
+                }
+                else if (versionCheck == ServerVersionCheck.Mismatch)
+                {
+                    // 非本项目启动：不杀（中心 Server 多项目共享，滚动升级期版本偏斜属常态）
+                    McpLog.Warn("中心 MCP HTTP Server 由其他项目启动且版本不一致，保留现有 Server（服务端会继续服务并自报版本偏斜）；如需统一请从启动它的项目升级或手动重启。");
+                }
+                // Unknown（探针失败/未就绪）：保持 serverReady=true，让后续连接/重试等它就绪，不进停杀路径
+            }
+            else if (!allowLaunch)
+            {
+                return false;
+            }
+
+            if (!serverReady)
+            {
+                // 未运行（或本项目启动的版本过旧 Server）时拉起；StartLocalHttpServerQuiet 内部
+                // 会先停掉过旧 Server 再启动，防重入由其自身的端口检查承担。
+                // 探针/停杀/部署/uv 全为阻塞调用，放线程池执行避免卡主线程。
+                bool launchRequested = await Task.Run(() => MCPServiceLocator.Server.StartLocalHttpServerQuiet());
+                if (!launchRequested)
+                {
+                    return false;
+                }
+
+                serverReady = await WaitForServerReadyAsync();
+            }
+
+            return serverReady;
         }
 
         private static bool IsEditorReadyForAutoConnect()
