@@ -19,15 +19,15 @@ Fork 自 [CoplayDev/unity-mcp](https://github.com/CoplayDev/unity-mcp)（MIT）�
 
 ## 安装（Unity Package Manager）
 
-在项目的 `Packages/manifest.json` 中添加（用 tag 锁定版本）：
+在项目的 `Packages/manifest.json` 中添加（`#release` 跟踪正式发版分支）：
 
 ```json
-"com.sora.unitymcp": "https://github.com/KasuganoSorakog/UnityMCP.git#v20260921.9.0"
+"com.sora.unitymcp": "https://github.com/KasuganoSorakog/UnityMCP.git#release"
 ```
 
 或在 Package Manager 窗口 `+` → `Add package from git URL...` 粘贴上面的 URL。
 
-升级：把 `#` 后的 tag 换成新版本即可；服务端源码会在下次启动 Server 时自动同步（保留 `.venv`）。
+升级：在 Package Manager 选中本包点 **Update** 即可拿到最新正式版；服务端源码会在升级后自动同步并重启（保留 `.venv`）。需要锁定/回滚到历史版本时，把 `#release` 改成 `#v<版本号>` 即可。
 
 ## 使用
 
@@ -65,7 +65,8 @@ UnityMCP/
 ## 版本约定
 
 - 包版本与服务端版本对齐，格式 `yyyyMMdd.N.0`（如 `20260921.3.0`）。
-- 每次发布打 git tag `v<版本号>`，各项目通过 tag 锁定。
+- 每次发布打 git tag `v<版本号>`，并把 `release` 分支推进到该 tag；各项目通过 `#release` 跟踪（点 Update 升级），需要固定版本时改用 `#v<版本号>`。
+- `main` 为开发分支，不保证随时可分发；请勿跟踪 `#main`。
 
 ## 服务端开发自测
 
