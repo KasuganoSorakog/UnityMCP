@@ -22,7 +22,7 @@ Fork 自 [CoplayDev/unity-mcp](https://github.com/CoplayDev/unity-mcp)（MIT）�
 在项目的 `Packages/manifest.json` 中添加（用 tag 锁定版本）：
 
 ```json
-"com.sora.unitymcp": "https://github.com/KasuganoSorakog/UnityMCP.git#v20260921.8.0"
+"com.sora.unitymcp": "https://github.com/KasuganoSorakog/UnityMCP.git#v20260921.9.0"
 ```
 
 或在 Package Manager 窗口 `+` → `Add package from git URL...` 粘贴上面的 URL。

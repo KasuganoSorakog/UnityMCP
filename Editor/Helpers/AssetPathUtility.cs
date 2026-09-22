@@ -291,22 +291,33 @@ namespace MCPForUnity.Editor.Helpers
             return false;
         }
 
+        // 包版本在域生命周期内不变（包更新必经域重载），缓存后任意线程可安全读取。
+        // 首次计算依赖 PackageInfo.FindForAssembly（仅主线程），故由 [InitializeOnLoad] 路径
+        // 在主线程预热（见 HttpBridgeReloadHandler 静态构造）；失败结果不缓存，
+        // 避免冷缓存时池线程拿到 "unknown" 污染整个域。
+        private static string s_packageVersionCache;
+
         /// <summary>
         /// Gets the package version from package.json
         /// </summary>
         /// <returns>Version string, or "unknown" if not found</returns>
         public static string GetPackageVersion()
         {
+            if (!string.IsNullOrEmpty(s_packageVersionCache))
+            {
+                return s_packageVersionCache;
+            }
+
             try
             {
-                var packageJson = GetPackageJson();
-                if (packageJson == null)
+                string version = GetPackageJson()?["version"]?.ToString();
+                if (string.IsNullOrEmpty(version))
                 {
                     return "unknown";
                 }
 
-                string version = packageJson["version"]?.ToString();
-                return string.IsNullOrEmpty(version) ? "unknown" : version;
+                s_packageVersionCache = version;
+                return version;
             }
             catch (Exception ex)
             {

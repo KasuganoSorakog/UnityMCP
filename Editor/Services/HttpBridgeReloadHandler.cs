@@ -22,6 +22,11 @@ namespace MCPForUnity.Editor.Services
             EditorSynchronizationContext = SynchronizationContext.Current;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
+
+            // 主线程预热包版本缓存：CheckRunningServerVersion 会在线程池里调 GetPackageVersion，
+            // 其内部 PackageInfo.FindForAssembly 仅主线程可用；此处（[InitializeOnLoad]，必在主线程、
+            // 且早于一切版本判定）预热后，后续任意线程直接命中缓存。
+            _ = AssetPathUtility.GetPackageVersion();
         }
 
         /// <summary>
