@@ -811,12 +811,14 @@ namespace MCPForUnity.Editor.Services
 
         /// <summary>
         /// Ownership check: returns true only when the server currently listening on the
-        /// configured local port was launched by THIS project — the pidfile+token handshake
-        /// (pidfile lives under this project's Library/MCPForUnity/RunState/) or the
-        /// stored-PID fallback, the same two strong signals IsLocalHttpServerRunning uses.
-        /// Its third best-effort signal (process merely looks like ours) is deliberately
-        /// NOT ownership: the central server is shared across projects, so a foreign-started
-        /// server must never be treated as ours to stop.
+        /// configured local port was launched by THIS project. The ONLY decisive evidence
+        /// is this project's own pidfile: its path is derived from the current project
+        /// root and passed to the server via --pidfile at launch, so the file only exists
+        /// when this project launched that server. The EditorPrefs handshake/stored-PID
+        /// values are machine-global (written by whichever project last launched any
+        /// server) and are deliberately NOT used here — reading them let any project
+        /// treat another project's server as its own and stop it during rolling upgrades
+        /// (cross-project kill loop).
         /// </summary>
         public bool IsRunningServerOwnedByThisProject()
         {
@@ -835,23 +837,13 @@ namespace MCPForUnity.Editor.Services
 
                 int port = uri.Port;
 
-                // Handshake path: pidfile+token exist and the pidfile PID is still the listener.
-                if (TryGetLocalHttpServerHandshake(out var pidFilePath, out _)
-                    && TryReadPidFromPidFile(pidFilePath, out var pidFromFile)
-                    && pidFromFile > 0)
+                // 唯一判据：本项目期望路径的 pidfile 存在，且其中 PID 仍是端口监听者。
+                // 其他项目启动服务端时 --pidfile 指向的是对方的项目目录，不会写这个文件。
+                string ownPidFile = GetLocalHttpServerPidFilePath(port);
+                if (TryReadPidFromPidFile(ownPidFile, out int pidFromFile) && pidFromFile > 0)
                 {
                     var pidsNow = GetListeningProcessIdsForPort(port);
                     if (pidsNow.Contains(pidFromFile))
-                    {
-                        return true;
-                    }
-                }
-
-                // Fallback: the PID stored at launch is still the listener.
-                if (TryGetStoredLocalServerPid(port, out int storedPid) && storedPid > 0)
-                {
-                    var pids = GetListeningProcessIdsForPort(port);
-                    if (pids.Contains(storedPid))
                     {
                         return true;
                     }
