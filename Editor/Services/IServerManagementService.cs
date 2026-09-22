@@ -41,12 +41,21 @@ namespace MCPForUnity.Editor.Services
         bool IsLocalHttpServerRunning();
 
         /// <summary>
-        /// Check whether the running local MCP HTTP server reports the same version as this
-        /// package (via the unauthenticated GET /plugin/diagnostics endpoint). Any failure to
-        /// determine the version (unreachable, timeout, non-2xx, unparsable response) is
-        /// treated as incompatible, so callers should restart the server to load fresh code.
+        /// Probe the running local MCP HTTP server's version (via the unauthenticated
+        /// GET /plugin/diagnostics endpoint) and compare it with this package's version.
+        /// Only a clearly-read, clearly-different version yields Mismatch; any probe
+        /// failure (timeout, non-2xx, unparsable, server still starting) yields Unknown,
+        /// which callers must never treat as a reason to restart the shared server.
         /// </summary>
-        bool IsRunningServerVersionCompatible();
+        ServerVersionCheck CheckRunningServerVersion();
+
+        /// <summary>
+        /// Ownership check: returns true only when the server listening on the configured
+        /// local port was launched by this project (pidfile/token handshake, or the
+        /// stored-PID fallback). Used to never stop a central server started by
+        /// another project (the central server is shared across projects).
+        /// </summary>
+        bool IsRunningServerOwnedByThisProject();
 
         /// <summary>
         /// Attempts to get the command that will be executed when starting the local HTTP server

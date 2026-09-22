@@ -256,13 +256,30 @@ namespace MCPForUnity.Editor.Services
                         return;
                     }
 
-                    bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning()
-                        && await Task.Run(() => MCPServiceLocator.Server.IsRunningServerVersionCompatible());
+                    bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning();
+                    if (serverReady)
+                    {
+                        var versionCheck = await Task.Run(() => MCPServiceLocator.Server.CheckRunningServerVersion());
+                        if (versionCheck == ServerVersionCheck.Mismatch
+                            && await Task.Run(() => MCPServiceLocator.Server.IsRunningServerOwnedByThisProject()))
+                        {
+                            // 本项目启动的 Server 版本明确过旧：置为未就绪，进入下方 launch 分支停旧起新
+                            serverReady = false;
+                        }
+                        else if (versionCheck == ServerVersionCheck.Mismatch)
+                        {
+                            // 非本项目启动：不杀（中心 Server 多项目共享，滚动升级期版本偏斜属常态）
+                            McpLog.Warn("中心 MCP HTTP Server 由其他项目启动且版本不一致，保留现有 Server（服务端会继续服务并自报版本偏斜）；如需统一请从启动它的项目升级或手动重启。");
+                        }
+                        // Unknown（探针失败/未就绪）：保持 serverReady=true，让后续连接/重试等它就绪，不进停杀路径
+                    }
+
                     if (!serverReady)
                     {
-                        // 未运行或版本不兼容时（重新）拉起；版本过旧时 StartLocalHttpServerQuiet
-                        // 内部会先停掉旧 Server 再启动，防重入由其自身的端口检查承担
-                        bool launchRequested = MCPServiceLocator.Server.StartLocalHttpServerQuiet();
+                        // 未运行（或本项目启动的版本过旧 Server）时拉起；StartLocalHttpServerQuiet 内部
+                        // 会先停掉过旧 Server 再启动，防重入由其自身的端口检查承担。
+                        // 探针/停杀/部署/uv 全为阻塞调用，放线程池执行避免卡主线程。
+                        bool launchRequested = await Task.Run(() => MCPServiceLocator.Server.StartLocalHttpServerQuiet());
                         if (!launchRequested)
                         {
                             await DelayBeforeRetryAsync(attempt);

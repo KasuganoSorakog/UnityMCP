@@ -626,6 +626,23 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_classified_payload_defaults_retryable_true_for_bare_exception(self):
+        # A bare PluginDisconnectedError (no classification fields set) must not
+        # produce retryable=False — the guard payload means "temporarily
+        # unreachable, safe to retry", so the fallback must be True.
+        from transport.unity_instance_middleware import _classified_error_payload
+
+        bare = unity_instance_middleware.PluginDisconnectedError("gone")
+        payload = _classified_error_payload(bare)
+        self.assertIs(payload["retryable"], True)
+        self.assertEqual(payload["code"], "unity_instance_unreachable")
+        self.assertEqual(payload["category"], "session")
+
+        explicit_false = unity_instance_middleware.PluginDisconnectedError(
+            "gone", retryable=False)
+        payload_false = _classified_error_payload(explicit_false)
+        self.assertIs(payload_false["retryable"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

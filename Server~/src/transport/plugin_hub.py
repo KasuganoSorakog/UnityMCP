@@ -748,7 +748,15 @@ class PluginHub(WebSocketEndpoint):
                     cls._eviction_in_progress.add(candidate_id)
                     # Captured for rollback: register() below atomically drops
                     # the old record, so restoring it needs the original data.
-                    previous_session = await registry.get_session(candidate_id)
+                    try:
+                        previous_session = await registry.get_session(candidate_id)
+                    except Exception:
+                        # 标记泄漏兜底：此处抛出会让 _evict_superseded_session
+                        # 永不执行，标记不摘会让该 session 永久免疫孤儿清扫。
+                        cls._eviction_in_progress.discard(candidate_id)
+                        previous_session_id = None
+                        previous_websocket = None
+                        raise
                 elif candidate_ws is websocket:
                     # Same connection re-registering (e.g. a client retry):
                     # drop the old session's state so reverse websocket lookups

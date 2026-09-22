@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcpforunityserver"
-version = "20260921.5.0"
+version = "20260921.6.0"
 description = "Project-local MCP for Unity server with central multi-project routing hardening."
 requires-python = ">=3.11"
 dependencies = [

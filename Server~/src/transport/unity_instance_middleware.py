@@ -65,7 +65,9 @@ def _classified_error_payload(exc: PluginDisconnectedError) -> dict[str, Any]:
         code=exc.code or "unity_instance_unreachable",
         category=exc.category or "session",
         error=str(exc),
-        retryable=bool(exc.retryable),
+        # 缺省回退 True：本 payload 用于"暂不可达、可安全重试"的守卫路径，
+        # bool(None)=False 会与 code 语义矛盾（仅当异常显式携带 False 才尊重它）。
+        retryable=exc.retryable if exc.retryable is not None else True,
         retry_after_ms=exc.retry_after_ms,
         hint=exc.hint,
     )

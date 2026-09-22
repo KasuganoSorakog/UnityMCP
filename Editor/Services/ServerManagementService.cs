@@ -16,6 +16,21 @@ using UnityEngine;
 namespace MCPForUnity.Editor.Services
 {
     /// <summary>
+    /// Tri-state result of probing the running MCP HTTP server's version.
+    /// Only a clearly-read, clearly-different version is Mismatch; any probe
+    /// failure is Unknown, which callers must never treat as a reason to restart.
+    /// </summary>
+    public enum ServerVersionCheck
+    {
+        /// <summary>Server responded and its version matches this package.</summary>
+        Compatible,
+        /// <summary>Server responded and its version is clearly different from this package.</summary>
+        Mismatch,
+        /// <summary>Version could not be determined (timeout, non-2xx, unparsable, missing field, server still starting).</summary>
+        Unknown
+    }
+
+    /// <summary>
     /// Service for managing MCP server lifecycle
     /// </summary>
     public class ServerManagementService : IServerManagementService
@@ -31,6 +46,13 @@ namespace MCPForUnity.Editor.Services
             "fastapi",
             "uvicorn",
             "httpx"
+        };
+
+        // 版本探测用共享 HttpClient（CheckRunningServerVersion）：避免每次 new 的套接字开销，
+        // 超时固定 3s。仅用于短小的 /plugin/diagnostics GET，无并发状态问题。
+        private static readonly HttpClient VersionCheckHttpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(3)
         };
 
         private static string GetProjectRootPath()
@@ -440,16 +462,36 @@ namespace MCPForUnity.Editor.Services
             // project from overwriting the runtime while the first server process is active.
             if (IsLocalHttpServerRunning())
             {
-                if (IsRunningServerVersionCompatible())
+                // 三态判定：只有"明确读到版本且不一致 + 本进程是本项目启动的"才允许停杀重启。
+                // Unknown（探针失败/未就绪）或 Mismatch 但属其他项目启动时一律复用，
+                // 避免误杀健康但忙碌的服务端，或多项目滚动升级期互相停杀拉锯。
+                var versionCheck = CheckRunningServerVersion();
+                if (versionCheck == ServerVersionCheck.Compatible)
                 {
                     McpLog.Info("中心 MCP HTTP Server 已运行，复用现有 Server。");
                     return true;
                 }
 
-                // 运行中的服务端版本与当前包不一致（包已升级但旧进程仍占用端口）：
-                // 停掉旧进程，继续走下方正常启动流程以加载新部署的服务端代码。
-                McpLog.Warn("中心 MCP HTTP Server 版本过旧，重启加载新服务端代码。");
-                StopLocalHttpServerInternal(quiet: true, allowNonLocalUrl: true);
+                if (versionCheck == ServerVersionCheck.Mismatch
+                    && IsRunningServerOwnedByThisProject())
+                {
+                    // 运行中的 Server 由本项目启动且版本明确过旧（包已升级但旧进程仍占用端口）：
+                    // 停掉旧进程，继续走下方正常启动流程以加载新部署的服务端代码。
+                    McpLog.Warn("中心 MCP HTTP Server 版本过旧，重启加载新服务端代码。");
+                    StopLocalHttpServerInternal(quiet: true, allowNonLocalUrl: true);
+                }
+                else
+                {
+                    if (versionCheck == ServerVersionCheck.Mismatch)
+                    {
+                        McpLog.Warn("中心 MCP HTTP Server 由其他项目启动且版本不一致，保留现有 Server（服务端会继续服务并自报版本偏斜）；如需统一请从启动它的项目升级或手动重启。");
+                    }
+                    else
+                    {
+                        McpLog.Debug("中心 MCP HTTP Server 版本探测失败或尚未就绪，复用现有 Server。");
+                    }
+                    return true;
+                }
             }
 
             /// Clean stale Python build artifacts when using a local dev server path
@@ -698,40 +740,124 @@ namespace MCPForUnity.Editor.Services
         }
 
         /// <summary>
-        /// Check whether the running local MCP HTTP server matches this package's version.
-        /// Queries the unauthenticated GET /plugin/diagnostics endpoint and compares
-        /// server.version against AssetPathUtility.GetPackageVersion() (the two are
-        /// version-locked by convention). Any failure (unreachable, timeout, non-2xx,
-        /// unparsable or missing version field) is treated as incompatible so the
-        /// caller restarts the server and loads the newly deployed server code.
+        /// Probe the running local MCP HTTP server's version via the unauthenticated
+        /// GET /plugin/diagnostics endpoint and compare server.version against
+        /// AssetPathUtility.GetPackageVersion() (the two are version-locked by convention).
+        /// Only a clearly-read, clearly-different version returns Mismatch; any probe
+        /// failure (timeout, non-2xx, unparsable, missing field, server still starting)
+        /// returns Unknown so callers never kill a healthy-but-busy shared server.
         /// </summary>
-        public bool IsRunningServerVersionCompatible()
+        public ServerVersionCheck CheckRunningServerVersion()
         {
             try
             {
                 string baseUrl = HttpEndpointUtility.GetBaseUrl().TrimEnd('/');
-                using (var client = new HttpClient())
+                // Task.Run 包裹后再同步阻塞：避免在 Unity 主线程直接 GetResult() 时
+                // HttpClient 续体捕获 Editor SynchronizationContext 造成死锁。
+                string body = Task.Run(() => VersionCheckHttpClient.GetStringAsync($"{baseUrl}/plugin/diagnostics"))
+                    .GetAwaiter().GetResult();
+                string serverVersion = JObject.Parse(body)["server"]?["version"]?.ToString();
+                if (string.IsNullOrEmpty(serverVersion))
                 {
-                    client.Timeout = TimeSpan.FromSeconds(3);
-                    // Task.Run 包裹后再同步阻塞：避免在 Unity 主线程直接 GetResult() 时
-                    // HttpClient 续体捕获 Editor SynchronizationContext 造成死锁。
-                    string body = Task.Run(() => client.GetStringAsync($"{baseUrl}/plugin/diagnostics"))
-                        .GetAwaiter().GetResult();
-                    string serverVersion = JObject.Parse(body)["server"]?["version"]?.ToString();
-                    string packageVersion = AssetPathUtility.GetPackageVersion();
-                    if (string.IsNullOrEmpty(serverVersion) || string.IsNullOrEmpty(packageVersion))
-                    {
-                        return false;
-                    }
-
-                    if (!string.Equals(serverVersion, packageVersion, StringComparison.Ordinal))
-                    {
-                        McpLog.Warn($"中心 MCP HTTP Server 版本不一致（运行中: {serverVersion}，当前包: {packageVersion}）。");
-                        return false;
-                    }
-
-                    return true;
+                    McpLog.Debug("中心 MCP HTTP Server 诊断应答缺少 server.version 字段（视为 Unknown）。");
+                    return ServerVersionCheck.Unknown;
                 }
+
+                string packageVersion = AssetPathUtility.GetPackageVersion();
+                if (string.IsNullOrEmpty(packageVersion) || packageVersion == "unknown")
+                {
+                    // 本地包版本都取不到时无法可靠判定"不一致"，按 Unknown 处理避免误杀
+                    return ServerVersionCheck.Unknown;
+                }
+
+                if (VersionsMatch(serverVersion, packageVersion))
+                {
+                    return ServerVersionCheck.Compatible;
+                }
+
+                McpLog.Warn($"中心 MCP HTTP Server 版本不一致（运行中: {serverVersion}，当前包: {packageVersion}）。");
+                return ServerVersionCheck.Mismatch;
+            }
+            catch (Exception ex)
+            {
+                McpLog.Debug($"中心 MCP HTTP Server 版本探测失败（视为 Unknown）：{ex.Message}");
+                return ServerVersionCheck.Unknown;
+            }
+        }
+
+        /// <summary>
+        /// Version comparison aligned with the server side (plugin_hub.py strips any
+        /// "+suffix" and lowercases before comparing): ignore "+..." build metadata
+        /// on both sides and compare case-insensitively.
+        /// </summary>
+        private static bool VersionsMatch(string serverVersion, string packageVersion)
+        {
+            return string.Equals(
+                StripVersionSuffix(serverVersion),
+                StripVersionSuffix(packageVersion),
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string StripVersionSuffix(string version)
+        {
+            if (string.IsNullOrEmpty(version))
+            {
+                return string.Empty;
+            }
+
+            int plusIndex = version.IndexOf('+');
+            return (plusIndex >= 0 ? version.Substring(0, plusIndex) : version).Trim();
+        }
+
+        /// <summary>
+        /// Ownership check: returns true only when the server currently listening on the
+        /// configured local port was launched by THIS project — the pidfile+token handshake
+        /// (pidfile lives under this project's Library/MCPForUnity/RunState/) or the
+        /// stored-PID fallback, the same two strong signals IsLocalHttpServerRunning uses.
+        /// Its third best-effort signal (process merely looks like ours) is deliberately
+        /// NOT ownership: the central server is shared across projects, so a foreign-started
+        /// server must never be treated as ours to stop.
+        /// </summary>
+        public bool IsRunningServerOwnedByThisProject()
+        {
+            try
+            {
+                string httpUrl = HttpEndpointUtility.GetBaseUrl();
+                if (!IsLocalUrl(httpUrl))
+                {
+                    return false;
+                }
+
+                if (!Uri.TryCreate(httpUrl, UriKind.Absolute, out var uri) || uri.Port <= 0)
+                {
+                    return false;
+                }
+
+                int port = uri.Port;
+
+                // Handshake path: pidfile+token exist and the pidfile PID is still the listener.
+                if (TryGetLocalHttpServerHandshake(out var pidFilePath, out _)
+                    && TryReadPidFromPidFile(pidFilePath, out var pidFromFile)
+                    && pidFromFile > 0)
+                {
+                    var pidsNow = GetListeningProcessIdsForPort(port);
+                    if (pidsNow.Contains(pidFromFile))
+                    {
+                        return true;
+                    }
+                }
+
+                // Fallback: the PID stored at launch is still the listener.
+                if (TryGetStoredLocalServerPid(port, out int storedPid) && storedPid > 0)
+                {
+                    var pids = GetListeningProcessIdsForPort(port);
+                    if (pids.Contains(storedPid))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
             catch
             {
