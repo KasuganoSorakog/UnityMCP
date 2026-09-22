@@ -1343,8 +1343,17 @@ namespace MCPForUnity.Editor.Services
             // 注意：不能只在前置检查失败时才调用——前置检查不比版本，旧版本目录会让升级同步永远跳过。
             if (!ServerDeploymentService.EnsureProjectLocalServer(out string deployMessage))
             {
-                error = deployMessage;
-                return false;
+                // 部署/同步失败不硬失败：项目内已有完整可跑的服务端时 Warn 后继续用它启动，
+                // 只有完全没有可用服务端时才 return false（回归修复：磁盘/IO 错误不应拖垮已有部署）
+                if (ServerDeploymentService.HasRunnableProjectServer())
+                {
+                    McpLog.Warn($"MCP Server 部署/同步失败，继续使用项目内现有服务端：{deployMessage}");
+                }
+                else
+                {
+                    error = deployMessage;
+                    return false;
+                }
             }
 
             if (!AssetPathUtility.TryGetPrivateServerSource(out fromUrl, out error))

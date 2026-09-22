@@ -38,6 +38,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private static readonly TimeSpan RegistrationTimeout = TimeSpan.FromSeconds(10);
         // ConnectAsync 无内置超时：服务端接受 TCP 但 WS 握手挂起时会无限等待，需独立超时兜底
         private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(15);
+        // CloseAsync 对端已死时可能无限挂起：关闭握手加有界等待，超时直接放弃进 finally Dispose
+        private static readonly TimeSpan CloseHandshakeTimeout = TimeSpan.FromSeconds(2);
         // 单条 WebSocket 消息的接收上限（对齐 legacy TCP 的 64MB）
         private const long MaxMessageBytes = 64L * 1024 * 1024;
 
@@ -49,6 +51,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private Task _keepAliveTask;
         private TaskCompletionSource<string> _registrationCompletion;
         private readonly SemaphoreSlim _sendLock = new(1, 1);
+        // 串行化 EstablishConnectionAsync：手动连接与自动重连并发进入时会交错操作共享的 _socket/_connectionCts
+        private readonly SemaphoreSlim _connectLock = new(1, 1);
 
         private Uri _endpointUri;
         private string _sessionId;
@@ -132,7 +136,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 {
                     if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
                     {
-                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Shutdown", CancellationToken.None).ConfigureAwait(false);
+                        // 有界等待：对端已死时 CloseAsync 可能无限挂起，超时放弃握手直接进 finally Dispose
+                        using var closeTimeoutCts = new CancellationTokenSource(CloseHandshakeTimeout);
+                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Shutdown", closeTimeoutCts.Token).ConfigureAwait(false);
                     }
                 }
                 catch { }
@@ -194,6 +200,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
 
             _sendLock?.Dispose();
+            _connectLock?.Dispose();
             _socket?.Dispose();
             _lifecycleCts?.Dispose();
             _disposed = true;
@@ -201,65 +208,84 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         private async Task<bool> EstablishConnectionAsync(CancellationToken token)
         {
-            await StopConnectionLoopsAsync().ConfigureAwait(false);
-
-            _connectionCts?.Dispose();
-            _connectionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-            CancellationToken connectionToken = _connectionCts.Token;
-
-            _socket?.Dispose();
-            _socket = new ClientWebSocket();
-            _socket.Options.KeepAliveInterval = _socketKeepAliveInterval;
-            _sessionId = null;
-            _registrationCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-            // 独立连接超时：握手挂起时抛 OperationCanceledException，走"连接失败返回 false"，
-            // 避免 TransportManager 缓存的启动任务永久卡住；linked CTS 随作用域 Dispose
-            using var connectTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(connectionToken);
-            connectTimeoutCts.CancelAfter(ConnectTimeout);
+            // 串行化建立连接全过程：手动连接（StartAsync）与自动重连（AttemptReconnectAsync）
+            // 可能并发进入，交错时一条路径失败后的清理会拆掉另一条路径新建的 socket/CTS。
+            // 本方法不会被任何已持锁的路径再调用（无重入死锁）；等待期间被取消按失败返回。
             try
             {
-                await _socket.ConnectAsync(_endpointUri, connectTimeoutCts.Token).ConfigureAwait(false);
+                await _connectLock.WaitAsync(token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (!connectionToken.IsCancellationRequested)
+            catch (OperationCanceledException)
             {
-                McpLog.Error($"[WebSocket] Connection timed out after {ConnectTimeout.TotalSeconds:0} seconds");
-                await CleanupFailedConnectionAsync().ConfigureAwait(false);
-                return false;
-            }
-            catch (Exception ex)
-            {
-                McpLog.Error($"[WebSocket] Connection failed: {ex.Message}");
-                await CleanupFailedConnectionAsync().ConfigureAwait(false);
                 return false;
             }
 
-            StartBackgroundLoops(connectionToken);
-
             try
             {
-                await SendRegisterAsync(connectionToken).ConfigureAwait(false);
+                await StopConnectionLoopsAsync().ConfigureAwait(false);
 
-                Task registrationTask = _registrationCompletion.Task;
-                Task timeoutTask = Task.Delay(RegistrationTimeout, connectionToken);
-                Task completedTask = await Task.WhenAny(registrationTask, timeoutTask).ConfigureAwait(false);
-                if (completedTask != registrationTask)
+                _connectionCts?.Dispose();
+                _connectionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                CancellationToken connectionToken = _connectionCts.Token;
+
+                _socket?.Dispose();
+                _socket = new ClientWebSocket();
+                _socket.Options.KeepAliveInterval = _socketKeepAliveInterval;
+                _sessionId = null;
+                _registrationCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                // 独立连接超时：握手挂起时抛 OperationCanceledException，走"连接失败返回 false"，
+                // 避免 TransportManager 缓存的启动任务永久卡住；linked CTS 随作用域 Dispose
+                using var connectTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(connectionToken);
+                connectTimeoutCts.CancelAfter(ConnectTimeout);
+                try
                 {
-                    McpLog.Error($"[WebSocket] Registration acknowledgement timed out after {RegistrationTimeout.TotalSeconds:0} seconds");
+                    await _socket.ConnectAsync(_endpointUri, connectTimeoutCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!connectionToken.IsCancellationRequested)
+                {
+                    McpLog.Error($"[WebSocket] Connection timed out after {ConnectTimeout.TotalSeconds:0} seconds");
+                    await CleanupFailedConnectionAsync().ConfigureAwait(false);
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    McpLog.Error($"[WebSocket] Connection failed: {ex.Message}");
                     await CleanupFailedConnectionAsync().ConfigureAwait(false);
                     return false;
                 }
 
-                await registrationTask.ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                McpLog.Error($"[WebSocket] Registration failed: {ex.Message}");
-                await CleanupFailedConnectionAsync().ConfigureAwait(false);
-                return false;
-            }
+                StartBackgroundLoops(connectionToken);
 
-            return true;
+                try
+                {
+                    await SendRegisterAsync(connectionToken).ConfigureAwait(false);
+
+                    Task registrationTask = _registrationCompletion.Task;
+                    Task timeoutTask = Task.Delay(RegistrationTimeout, connectionToken);
+                    Task completedTask = await Task.WhenAny(registrationTask, timeoutTask).ConfigureAwait(false);
+                    if (completedTask != registrationTask)
+                    {
+                        McpLog.Error($"[WebSocket] Registration acknowledgement timed out after {RegistrationTimeout.TotalSeconds:0} seconds");
+                        await CleanupFailedConnectionAsync().ConfigureAwait(false);
+                        return false;
+                    }
+
+                    await registrationTask.ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    McpLog.Error($"[WebSocket] Registration failed: {ex.Message}");
+                    await CleanupFailedConnectionAsync().ConfigureAwait(false);
+                    return false;
+                }
+
+                return true;
+            }
+            finally
+            {
+                _connectLock.Release();
+            }
         }
 
         /// <summary>
@@ -277,7 +303,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 {
                     if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
                     {
-                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Connection failed", CancellationToken.None).ConfigureAwait(false);
+                        // 有界等待：对端已死时 CloseAsync 可能无限挂起，超时放弃握手直接进 finally Dispose
+                        using var closeTimeoutCts = new CancellationTokenSource(CloseHandshakeTimeout);
+                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Connection failed", closeTimeoutCts.Token).ConfigureAwait(false);
                     }
                 }
                 catch { }
@@ -498,13 +526,22 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             // 不在持锁状态下等待后台任务，避免死锁
             await StopConnectionLoopsAsync(awaitTasks: false).ConfigureAwait(false);
 
-            if (_socket != null && _socket.State == WebSocketState.Open)
+            if (_socket != null)
             {
                 try
                 {
-                    await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Superseded", CancellationToken.None).ConfigureAwait(false);
+                    if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
+                    {
+                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Superseded", CancellationToken.None).ConfigureAwait(false);
+                    }
                 }
                 catch { }
+                finally
+                {
+                    // 对齐 CleanupFailedConnectionAsync：被顶替的旧 socket 也要释放，不留 native 句柄
+                    _socket.Dispose();
+                    _socket = null;
+                }
             }
         }
 
@@ -865,7 +902,28 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 return;
             }
 
-            _ = Task.Run(() => AttemptReconnectAsync(_lifecycleCts.Token), CancellationToken.None);
+            // 在 lambda 体外同步捕获 token：lambda 要到线程池执行时才求值，届时 _lifecycleCts
+            // 可能已被并发 StopAsync 置 null/dispose，异常会在 AttemptReconnectAsync 的 try
+            // 之外抛出，导致 _isReconnectingFlag 永不复位（自动重连静默失效）。取不到就复位返回。
+            CancellationTokenSource lifecycleCts = _lifecycleCts;
+            if (lifecycleCts == null)
+            {
+                Interlocked.Exchange(ref _isReconnectingFlag, 0);
+                return;
+            }
+
+            CancellationToken lifecycleToken;
+            try
+            {
+                lifecycleToken = lifecycleCts.Token;
+            }
+            catch (ObjectDisposedException)
+            {
+                Interlocked.Exchange(ref _isReconnectingFlag, 0);
+                return;
+            }
+
+            _ = Task.Run(() => AttemptReconnectAsync(lifecycleToken), CancellationToken.None);
         }
 
         private async Task AttemptReconnectAsync(CancellationToken token)

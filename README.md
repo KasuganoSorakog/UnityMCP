@@ -22,7 +22,7 @@ Fork 自 [CoplayDev/unity-mcp](https://github.com/CoplayDev/unity-mcp)（MIT）�
 在项目的 `Packages/manifest.json` 中添加（用 tag 锁定版本）：
 
 ```json
-"com.sora.unitymcp": "https://github.com/KasuganoSorakog/UnityMCP.git#v20260921.2.0"
+"com.sora.unitymcp": "https://github.com/KasuganoSorakog/UnityMCP.git#v20260921.3.0"
 ```
 
 或在 Package Manager 窗口 `+` → `Add package from git URL...` 粘贴上面的 URL。
@@ -44,7 +44,7 @@ Fork 自 [CoplayDev/unity-mcp](https://github.com/CoplayDev/unity-mcp)（MIT）�
 
 ```bash
 # PyPI 镜像（清华）
-setx UV_INDEX_URL "https://pypi.tuna.tsinghua.edu.cn/simple"
+setx UV_DEFAULT_INDEX "https://pypi.tuna.tsinghua.edu.cn/simple"
 # uv 下载 Python 的镜像（南京大学）
 setx UV_PYTHON_INSTALL_MIRROR "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone"
 ```
@@ -59,13 +59,12 @@ UnityMCP/
 └── Server~/          # Python MCP 服务端（~ 目录 Unity 不导入，随包分发）
     ├── pyproject.toml
     ├── src/
-    ├── tests/
-    └── vendor/
+    └── tests/
 ```
 
 ## 版本约定
 
-- 包版本与服务端版本对齐，格式 `yyyyMMdd.N.0`（如 `20260921.1.0`）。
+- 包版本与服务端版本对齐，格式 `yyyyMMdd.N.0`（如 `20260921.3.0`）。
 - 每次发布打 git tag `v<版本号>`，各项目通过 tag 锁定。
 
 ## 服务端开发自测

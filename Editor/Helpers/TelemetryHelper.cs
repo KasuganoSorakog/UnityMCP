@@ -113,6 +113,11 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static void RecordBridgeStartup()
         {
+            // Telemetry is permanently disabled in this fork (IsEnabled is always false):
+            // short-circuit before evaluating the payload dictionary (GetPackageVersion etc.).
+            if (!IsEnabled)
+                return;
+
             RecordEvent("bridge_startup", new Dictionary<string, object>
             {
                 ["bridge_version"] = AssetPathUtility.GetPackageVersion(),
@@ -125,6 +130,10 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static void RecordBridgeConnection(bool success, string error = null)
         {
+            // Telemetry permanently disabled: short-circuit before building the payload.
+            if (!IsEnabled)
+                return;
+
             var data = new Dictionary<string, object>
             {
                 ["success"] = success
@@ -143,6 +152,10 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static void RecordToolExecution(string toolName, bool success, float durationMs, string error = null)
         {
+            // Telemetry permanently disabled: short-circuit before building the payload.
+            if (!IsEnabled)
+                return;
+
             var data = new Dictionary<string, object>
             {
                 ["tool_name"] = toolName,

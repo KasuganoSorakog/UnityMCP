@@ -101,10 +101,25 @@ namespace MCPForUnity.Editor.Services
         /// </summary>
         private static bool IsDeploymentComplete(string projectPath)
         {
+            // 目录指纹与包内 Server~/src 的实际目录（core/models/services/transport/utils）及 tests 一一对齐
             return File.Exists(Path.Combine(projectPath, "uv.lock"))
                 && File.Exists(Path.Combine(projectPath, "src", "main.py"))
                 && Directory.Exists(Path.Combine(projectPath, "src", "core"))
-                && Directory.Exists(Path.Combine(projectPath, "src", "transport"));
+                && Directory.Exists(Path.Combine(projectPath, "src", "models"))
+                && Directory.Exists(Path.Combine(projectPath, "src", "services"))
+                && Directory.Exists(Path.Combine(projectPath, "src", "transport"))
+                && Directory.Exists(Path.Combine(projectPath, "src", "utils"))
+                && Directory.Exists(Path.Combine(projectPath, "tests"));
+        }
+
+        /// <summary>
+        /// True when the project-local server deployment is complete enough to run.
+        /// Fallback for when a re-sync attempt fails (transient IO errors etc.):
+        /// an existing good deployment should still be usable instead of hard-failing START.
+        /// </summary>
+        public static bool HasRunnableProjectServer()
+        {
+            return IsDeploymentComplete(GetProjectServerPath());
         }
 
         /// <summary>
@@ -132,6 +147,12 @@ namespace MCPForUnity.Editor.Services
 
             foreach (string file in Directory.GetFiles(targetRoot))
             {
+                // .gitignore 由部署器按项目需要写入（且可能已被项目自定义），不属于同步源，保留
+                if (string.Equals(Path.GetFileName(file), ".gitignore", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 File.Delete(file);
             }
 
