@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import time
@@ -174,6 +175,39 @@ class ExternalChangesScanner:
         st.manifest_last_mtime_ns = mtime_ns
         return [Path(p) for p in deduped if p]
 
+    def _snapshot(self, st: ExternalChangesState) -> dict[str, int | bool | None]:
+        return {
+            "external_changes_dirty": st.dirty,
+            "external_changes_last_seen_unix_ms": st.external_changes_last_seen_unix_ms,
+            "dirty_since_unix_ms": st.dirty_since_unix_ms,
+            "last_cleared_unix_ms": st.last_cleared_unix_ms,
+        }
+
+    def _apply_scan_result(self, st: ExternalChangesState, newest: int | None, now: int) -> None:
+        if newest is None:
+            return
+        if st.last_seen_mtime_ns is None:
+            st.last_seen_mtime_ns = newest
+        elif newest > st.last_seen_mtime_ns:
+            st.last_seen_mtime_ns = newest
+            st.external_changes_last_seen_unix_ms = now
+            if not st.dirty:
+                st.dirty = True
+                st.dirty_since_unix_ms = now
+
+    def _resolve_scan_paths(self, st: ExternalChangesState) -> list[Path] | None:
+        project_root = st.project_root
+        if not project_root:
+            return None
+        root = Path(project_root)
+        paths = [root / "Assets", root / "ProjectSettings", root / "Packages"]
+        # Include any local package roots referenced by file: deps in Packages/manifest.json
+        try:
+            paths.extend(self._resolve_manifest_extra_roots(root, st))
+        except Exception:
+            pass
+        return paths
+
     def update_and_get(self, instance_id: str) -> dict[str, int | bool | None]:
         """
         Returns a small dict suitable for embedding in editor_state_v2.assets:
@@ -185,64 +219,48 @@ class ExternalChangesScanner:
         st = self._get_state(instance_id)
 
         if _in_pytest():
-            return {
-                "external_changes_dirty": st.dirty,
-                "external_changes_last_seen_unix_ms": st.external_changes_last_seen_unix_ms,
-                "dirty_since_unix_ms": st.dirty_since_unix_ms,
-                "last_cleared_unix_ms": st.last_cleared_unix_ms,
-            }
+            return self._snapshot(st)
 
         now = _now_unix_ms()
         if st.last_scan_unix_ms is not None and (now - st.last_scan_unix_ms) < self._scan_interval_ms:
-            return {
-                "external_changes_dirty": st.dirty,
-                "external_changes_last_seen_unix_ms": st.external_changes_last_seen_unix_ms,
-                "dirty_since_unix_ms": st.dirty_since_unix_ms,
-                "last_cleared_unix_ms": st.last_cleared_unix_ms,
-            }
+            return self._snapshot(st)
 
         st.last_scan_unix_ms = now
 
-        project_root = st.project_root
-        if not project_root:
-            return {
-                "external_changes_dirty": st.dirty,
-                "external_changes_last_seen_unix_ms": st.external_changes_last_seen_unix_ms,
-                "dirty_since_unix_ms": st.dirty_since_unix_ms,
-                "last_cleared_unix_ms": st.last_cleared_unix_ms,
-            }
+        paths = self._resolve_scan_paths(st)
+        if paths is None:
+            return self._snapshot(st)
 
-        root = Path(project_root)
-        paths = [root / "Assets", root / "ProjectSettings", root / "Packages"]
-        # Include any local package roots referenced by file: deps in Packages/manifest.json
-        try:
-            paths.extend(self._resolve_manifest_extra_roots(root, st))
-        except Exception:
-            pass
         newest = self._scan_paths_max_mtime_ns(paths)
-        if newest is None:
-            return {
-                "external_changes_dirty": st.dirty,
-                "external_changes_last_seen_unix_ms": st.external_changes_last_seen_unix_ms,
-                "dirty_since_unix_ms": st.dirty_since_unix_ms,
-                "last_cleared_unix_ms": st.last_cleared_unix_ms,
-            }
+        self._apply_scan_result(st, newest, now)
+        return self._snapshot(st)
 
-        if st.last_seen_mtime_ns is None:
-            st.last_seen_mtime_ns = newest
-        elif newest > st.last_seen_mtime_ns:
-            st.last_seen_mtime_ns = newest
-            st.external_changes_last_seen_unix_ms = now
-            if not st.dirty:
-                st.dirty = True
-                st.dirty_since_unix_ms = now
+    async def async_update_and_get(self, instance_id: str) -> dict[str, int | bool | None]:
+        """Async variant of update_and_get.
 
-        return {
-            "external_changes_dirty": st.dirty,
-            "external_changes_last_seen_unix_ms": st.external_changes_last_seen_unix_ms,
-            "dirty_since_unix_ms": st.dirty_since_unix_ms,
-            "last_cleared_unix_ms": st.last_cleared_unix_ms,
-        }
+        All ExternalChangesState reads/writes stay on the event loop; only the
+        expensive os.walk runs in a worker thread (it touches no shared state).
+        This keeps clear_dirty()/set_project_root() race-free while preventing
+        the scan from stalling the loop on large projects.
+        """
+        st = self._get_state(instance_id)
+
+        if _in_pytest():
+            return self._snapshot(st)
+
+        now = _now_unix_ms()
+        if st.last_scan_unix_ms is not None and (now - st.last_scan_unix_ms) < self._scan_interval_ms:
+            return self._snapshot(st)
+
+        st.last_scan_unix_ms = now
+
+        paths = self._resolve_scan_paths(st)
+        if paths is None:
+            return self._snapshot(st)
+
+        newest = await asyncio.to_thread(self._scan_paths_max_mtime_ns, paths)
+        self._apply_scan_result(st, newest, now)
+        return self._snapshot(st)
 
 
 # Global singleton (simple, process-local)

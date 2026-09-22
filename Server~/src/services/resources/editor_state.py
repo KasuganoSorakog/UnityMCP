@@ -1,6 +1,5 @@
 import os
 import time
-import asyncio
 from typing import Any
 
 from fastmcp import Context
@@ -295,10 +294,10 @@ async def get_editor_state_for_instance(
                     external_changes_scanner.set_project_root(
                         instance_id, project_root)
 
-            # The recursive mtime scan walks up to max_entries files; run it
-            # off the event loop so polling cannot stall unrelated requests.
-            ext = await asyncio.to_thread(
-                external_changes_scanner.update_and_get, instance_id)
+            # The recursive mtime scan walks up to max_entries files; the async
+            # variant runs it in a worker thread while keeping all state
+            # mutations on the event loop (race-free vs clear_dirty).
+            ext = await external_changes_scanner.async_update_and_get(instance_id)
 
             assets = state_v2.get("assets")
             if not isinstance(assets, dict):

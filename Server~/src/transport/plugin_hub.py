@@ -106,6 +106,10 @@ class PluginHub(WebSocketEndpoint):
     # "already running" (execution state unknown). Overridable via
     # UNITY_MCP_CANCEL_ACK_GRACE_SECONDS.
     CANCEL_ACK_GRACE_SECONDS = 2.0
+    # Upper bound for sending the RegisteredMessage while holding the global
+    # register lock: a stuck/half-open socket must not block every other
+    # project's registration forever.
+    REGISTER_ACK_SEND_TIMEOUT_SECONDS = 10.0
     # Fast-path commands should never block the client for long; return a retry hint instead.
     # This helps avoid the Cursor-side ~30s tool-call timeout when Unity is compiling/reloading
     # or is throttled while unfocused.
@@ -661,6 +665,7 @@ class PluginHub(WebSocketEndpoint):
         # superseding each other.
         previous_session_id: str | None = None
         previous_websocket: WebSocket | None = None
+        previous_session = None
         async with register_lock:
             candidate_id = await registry.get_session_id_by_hash(project_hash)
             if candidate_id:
@@ -669,6 +674,9 @@ class PluginHub(WebSocketEndpoint):
                 if candidate_ws is not None and candidate_ws is not websocket:
                     previous_session_id = candidate_id
                     previous_websocket = candidate_ws
+                    # Captured for rollback: register() below atomically drops
+                    # the old record, so restoring it needs the original data.
+                    previous_session = await registry.get_session(candidate_id)
                 elif candidate_ws is websocket:
                     # Same connection re-registering (e.g. a client retry):
                     # drop the old session's state so reverse websocket lookups
@@ -689,13 +697,35 @@ class PluginHub(WebSocketEndpoint):
             async with lock:
                 cls._connections[session.session_id] = websocket
 
-            # Inform the plugin of its assigned session ID. If the socket is
-            # already dying, roll back so no orphaned session/connection stays.
+            # Inform the plugin of its assigned session ID. Bounded wait: a
+            # stuck socket must not hold the (global) register lock forever.
+            # If the socket is already dying, roll back the new session and
+            # restore the superseded one so the project keeps a usable session.
             response = RegisteredMessage(session_id=session_id)
             try:
-                await websocket.send_json(response.model_dump())
+                await asyncio.wait_for(
+                    websocket.send_json(response.model_dump()),
+                    timeout=cls.REGISTER_ACK_SEND_TIMEOUT_SECONDS,
+                )
             except Exception:
                 await cls._cleanup_session_locked(session_id)
+                if previous_session is not None:
+                    restored = await registry.register(
+                        previous_session.session_id,
+                        previous_session.project_name,
+                        previous_session.project_hash,
+                        previous_session.unity_version,
+                        project_path=previous_session.project_path,
+                        package_version=previous_session.package_version,
+                        current_scene=previous_session.current_scene,
+                        capabilities_version=previous_session.capabilities_version,
+                    )
+                    async with lock:
+                        cls._connections[restored.session_id] = previous_websocket
+                    logger.info(
+                        "Restored superseded session %s after registration rollback",
+                        restored.session_id,
+                    )
                 try:
                     await websocket.close(code=1011)
                 except Exception:
@@ -807,6 +837,24 @@ class PluginHub(WebSocketEndpoint):
         has already dropped the old session record, so the cleanup below only
         clears the connection, in-flight commands and scheduler state.
         """
+        # Re-verify socket ownership before closing: the old client may have
+        # re-registered on the same socket while we were outside the register
+        # lock, and closing it now would kill that live session. (In that path
+        # the old session was already cleaned up during re-registration.)
+        lock = cls._lock
+        if lock is not None:
+            async with lock:
+                socket_reused = any(
+                    sid != previous_session_id and ws is previous_websocket
+                    for sid, ws in cls._connections.items()
+                )
+            if socket_reused:
+                logger.info(
+                    "Skipping eviction close for session %s: its socket was re-registered by a newer session",
+                    previous_session_id,
+                )
+                return
+
         logger.info(
             "Project hash %s re-registered by a new connection; superseding session %s",
             project_hash,

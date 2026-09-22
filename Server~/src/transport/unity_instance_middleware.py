@@ -270,6 +270,11 @@ class UnityInstanceMiddleware(Middleware):
     # server lifetime, so evict least-recently-used entries past this cap.
     _MAX_ACTIVE_KEYS = 512
 
+    # Tools that manage the instance selection itself must stay callable even
+    # when the stored selection is unreachable — they are the escape hatch out
+    # of a dead selection (e.g. the selected project was closed for good).
+    _SELECTION_MANAGEMENT_TOOLS = frozenset({"set_active_instance"})
+
     def __init__(self):
         super().__init__()
         self._active_by_key: OrderedDict[str, str] = OrderedDict()
@@ -443,12 +448,22 @@ class UnityInstanceMiddleware(Middleware):
     async def _inject_unity_instance(self, context: MiddlewareContext) -> None:
         """Inject active Unity instance into context if available."""
         ctx = context.fastmcp_context
+        # Selection-management tools are exempt from the reachability guard:
+        # they never execute against the stored (dead) instance, and blocking
+        # them would remove the only escape hatch from a dead selection.
+        tool_name = getattr(getattr(context, "message", None), "name", None)
+        is_selection_tool = tool_name in self._SELECTION_MANAGEMENT_TOOLS
 
         active_instance = self.get_active_instance(ctx)
         # Only HTTP transport may clear an unreachable selection here: in stdio
         # mode PluginHub is also configured but its registry stays empty, which
         # would wrongly wipe an explicitly chosen instance.
-        if active_instance and PluginHub.is_configured() and self._is_http_transport():
+        if (
+            active_instance
+            and not is_selection_tool
+            and PluginHub.is_configured()
+            and self._is_http_transport()
+        ):
             try:
                 await PluginHub._resolve_session_id(active_instance)
             except Exception as exc:
@@ -460,6 +475,10 @@ class UnityInstanceMiddleware(Middleware):
                 # the only one online — that would silently execute mutation
                 # commands on the WRONG project and persist the wrong selection.
                 # Keep the selection and fail this request as retryable instead.
+                # (Note: NoUnitySessionError also lands here; we deliberately do
+                # NOT auto-clear on it, because a domain-reload reconnect window
+                # looks identical at resolve time and clearing would let the next
+                # call autoselect a different sole-online project.)
                 logger.info(
                     "Stored active Unity instance %s is temporarily unreachable (%s); keeping selection and failing request as retryable",
                     active_instance,
@@ -467,7 +486,10 @@ class UnityInstanceMiddleware(Middleware):
                 )
                 raise PluginDisconnectedError(
                     f"Unity instance '{active_instance}' is temporarily unreachable "
-                    "(likely reconnecting); stored selection kept — retry shortly."
+                    "(likely reconnecting); stored selection kept. "
+                    "This request is safe to retry shortly (retryable). "
+                    "If the project was closed permanently, call set_active_instance "
+                    "to switch to another running project."
                 ) from exc
         if not active_instance:
             active_instance = await self._maybe_autoselect_instance(ctx)

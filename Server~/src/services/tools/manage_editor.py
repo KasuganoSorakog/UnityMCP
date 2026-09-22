@@ -4,7 +4,6 @@ from fastmcp import Context
 from mcp.types import ToolAnnotations
 
 from services.registry import mcp_for_unity_tool
-from core.telemetry import is_telemetry_enabled, record_tool_usage
 from services.tools import choose_unity_instance
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
@@ -38,11 +37,14 @@ async def manage_editor(
     try:
         # Diagnostics: quick telemetry checks
         if action == "telemetry_status":
-            return {"success": True, "telemetry_enabled": is_telemetry_enabled()}
+            # Telemetry was physically removed in this fork (no sender, no
+            # install ID, no worker thread); kept as an honest status answer.
+            return {"success": True, "telemetry_enabled": False,
+                    "message": "Telemetry has been removed in this fork; nothing is collected or sent."}
 
         if action == "telemetry_ping":
-            record_tool_usage("diagnostic_ping", True, 1.0, None)
-            return {"success": True, "message": "telemetry ping queued"}
+            return {"success": True,
+                    "message": "Telemetry has been removed in this fork; nothing was queued or sent."}
         # Prepare parameters, removing None values
         params = {
             "action": action,

@@ -3,7 +3,6 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 import os
-import threading
 import time
 from typing import AsyncIterator, Any
 from urllib.parse import urlparse
@@ -46,7 +45,7 @@ from services.custom_tool_service import CustomToolService
 from transport.plugin_hub import PluginHub
 from transport.plugin_registry import PluginRegistry
 from services.resources import register_all_resources
-from core.telemetry import record_milestone, record_telemetry, MilestoneType, RecordType, get_package_version
+from core.telemetry import get_package_version
 from services.tools import register_all_tools
 from transport.legacy.unity_connection import get_unity_connection_pool, UnityConnectionPool
 from transport.unity_instance_middleware import (
@@ -132,23 +131,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     # where the registry simply stays empty).
     PluginHub.start_session_sweeper()
 
-    # Record server startup telemetry
-    start_time = time.time()
-    start_clk = time.perf_counter()
-    server_version = get_package_version()
-    # Defer initial telemetry by 1s to avoid stdio handshake interference
-
-    def _emit_startup():
-        try:
-            record_telemetry(RecordType.STARTUP, {
-                "server_version": server_version,
-                "startup_time": start_time,
-            })
-            record_milestone(MilestoneType.FIRST_STARTUP)
-        except Exception:
-            logger.debug("Deferred startup telemetry failed", exc_info=True)
-    threading.Timer(1.0, _emit_startup).start()
-
     try:
         skip_connect = os.environ.get(
             "UNITY_MCP_SKIP_STARTUP_CONNECT", "").lower() in ("1", "true", "yes", "on")
@@ -169,16 +151,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
                     _unity_connection_pool.get_connection()
                     logger.info(
                         "Connected to default Unity instance on startup")
-
-                    # Record successful Unity connection (deferred)
-                    threading.Timer(1.0, lambda: record_telemetry(
-                        RecordType.UNITY_CONNECTION,
-                        {
-                            "status": "connected",
-                            "connection_time_ms": (time.perf_counter() - start_clk) * 1000,
-                            "instance_count": len(instances)
-                        }
-                    )).start()
                 except Exception as e:
                     logger.warning(
                         f"Could not connect to default Unity instance: {e}")
@@ -187,28 +159,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
     except ConnectionError as e:
         logger.warning(f"Could not connect to Unity on startup: {e}")
-
-        # Record connection failure (deferred)
-        _err_msg = str(e)[:200]
-        threading.Timer(1.0, lambda: record_telemetry(
-            RecordType.UNITY_CONNECTION,
-            {
-                "status": "failed",
-                "error": _err_msg,
-                "connection_time_ms": (time.perf_counter() - start_clk) * 1000,
-            }
-        )).start()
     except Exception as e:
         logger.warning(f"Unexpected error connecting to Unity on startup: {e}")
-        _err_msg = str(e)[:200]
-        threading.Timer(1.0, lambda: record_telemetry(
-            RecordType.UNITY_CONNECTION,
-            {
-                "status": "failed",
-                "error": _err_msg,
-                "connection_time_ms": (time.perf_counter() - start_clk) * 1000,
-            }
-        )).start()
 
     try:
         # Yield shared state for lifespan consumers (e.g., middleware)

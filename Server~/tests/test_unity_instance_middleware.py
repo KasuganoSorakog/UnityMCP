@@ -214,6 +214,52 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_selection_management_tool_exempt_from_unreachable_guard(self):
+        class ContextState(SimpleNamespace):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.state = {}
+
+            def set_state(self, key, value):
+                self.state[key] = value
+
+        class MiddlewareContext:
+            def __init__(self, fastmcp_context, message=None):
+                self.fastmcp_context = fastmcp_context
+                self.message = message
+
+        async def run_test():
+            middleware = UnityInstanceMiddleware()
+            middleware._is_http_transport = lambda: True
+            ctx = ContextState(
+                client_id="client-a",
+                session_id=None,
+                request_context=None,
+            )
+            middleware.set_active_instance(ctx, "ProjectA@aaa111")
+            old_plugin_hub = unity_instance_middleware.PluginHub
+            unity_instance_middleware.PluginHub = PluginHub
+            PluginHub.configured = True
+            try:
+                # The escape hatch: set_active_instance must stay callable even
+                # though the stored selection is unreachable.
+                await middleware._inject_unity_instance(
+                    MiddlewareContext(ctx, SimpleNamespace(name="set_active_instance")))
+
+                # Every other tool still fails fast as retryable.
+                with self.assertRaises(unity_instance_middleware.PluginDisconnectedError):
+                    await middleware._inject_unity_instance(
+                        MiddlewareContext(ctx, SimpleNamespace(name="manage_scene")))
+            finally:
+                PluginHub.configured = False
+                unity_instance_middleware.PluginHub = old_plugin_hub
+
+            # Selection survives both paths.
+            self.assertEqual(
+                middleware.get_active_instance(ctx), "ProjectA@aaa111")
+
+        asyncio.run(run_test())
+
     def test_stdio_transport_preserves_active_instance_on_pluginhub_miss(self):
         class ContextState(SimpleNamespace):
             def __init__(self, **kwargs):
