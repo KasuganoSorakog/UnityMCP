@@ -66,7 +66,30 @@ def classified_error_response(
 
 
 class PluginDisconnectedError(RuntimeError):
-    """Raised when a plugin WebSocket disconnects while commands are in flight."""
+    """Raised when a plugin WebSocket disconnects while commands are in flight.
+
+    Carries the same machine-readable classification contract as
+    ``classified_error_response`` so that raise-style paths (e.g. the instance
+    middleware guard, where returning a response dict is not possible) expose
+    the same fields as response-style paths (``send_command``).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        category: str | None = None,
+        retryable: bool | None = None,
+        retry_after_ms: int | None = None,
+        hint: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.category = category
+        self.retryable = retryable
+        self.retry_after_ms = retry_after_ms
+        self.hint = hint
 
 
 class NoUnitySessionError(RuntimeError):

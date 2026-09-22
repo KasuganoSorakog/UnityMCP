@@ -275,6 +275,13 @@ class UnityInstanceMiddleware(Middleware):
     # of a dead selection (e.g. the selected project was closed for good).
     _SELECTION_MANAGEMENT_TOOLS = frozenset({"set_active_instance"})
 
+    # Same escape hatch on the resource side: `mcpforunity://instances` is the
+    # enumeration entry point that set_active_instance's own error messages
+    # point to ("Use mcpforunity://instances to copy a Name@hash"). Resource
+    # messages carry `.uri` instead of `.name`, so they need a separate exempt
+    # list — otherwise a dead selection blocks the very listing needed to fix it.
+    _SELECTION_MANAGEMENT_RESOURCES = frozenset({"mcpforunity://instances"})
+
     def __init__(self):
         super().__init__()
         self._active_by_key: OrderedDict[str, str] = OrderedDict()
@@ -451,8 +458,17 @@ class UnityInstanceMiddleware(Middleware):
         # Selection-management tools are exempt from the reachability guard:
         # they never execute against the stored (dead) instance, and blocking
         # them would remove the only escape hatch from a dead selection.
-        tool_name = getattr(getattr(context, "message", None), "name", None)
+        message = getattr(context, "message", None)
+        tool_name = getattr(message, "name", None)
         is_selection_tool = tool_name in self._SELECTION_MANAGEMENT_TOOLS
+        # Resource reads (ReadResourceRequestParams) carry `.uri` instead of
+        # `.name`; AnyUrl may normalize trailing slashes, so compare stripped.
+        resource_uri = getattr(message, "uri", None)
+        is_selection_resource = (
+            resource_uri is not None
+            and str(resource_uri).rstrip("/") in self._SELECTION_MANAGEMENT_RESOURCES
+        )
+        is_selection_management = is_selection_tool or is_selection_resource
 
         active_instance = self.get_active_instance(ctx)
         # Only HTTP transport may clear an unreachable selection here: in stdio
@@ -460,7 +476,7 @@ class UnityInstanceMiddleware(Middleware):
         # would wrongly wipe an explicitly chosen instance.
         if (
             active_instance
-            and not is_selection_tool
+            and not is_selection_management
             and PluginHub.is_configured()
             and self._is_http_transport()
         ):
@@ -489,7 +505,12 @@ class UnityInstanceMiddleware(Middleware):
                     "(likely reconnecting); stored selection kept. "
                     "This request is safe to retry shortly (retryable). "
                     "If the project was closed permanently, call set_active_instance "
-                    "to switch to another running project."
+                    "to switch to another running project.",
+                    code="unity_instance_unreachable",
+                    category="session",
+                    retryable=True,
+                    retry_after_ms=2000,
+                    hint="retry",
                 ) from exc
         if not active_instance:
             active_instance = await self._maybe_autoselect_instance(ctx)

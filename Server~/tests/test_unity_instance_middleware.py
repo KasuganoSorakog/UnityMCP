@@ -38,7 +38,17 @@ class PluginHub:
 
 
 class PluginDisconnectedError(RuntimeError):
-    pass
+    """Mirror of transport.plugin_hub.PluginDisconnectedError (stubbed here to
+    avoid importing the real module's heavy dependencies). The real class is
+    contract-tested in test_plugin_disconnected_error.py."""
+
+    def __init__(self, message, *, code=None, category=None, retryable=None, retry_after_ms=None, hint=None):
+        super().__init__(message)
+        self.code = code
+        self.category = category
+        self.retryable = retryable
+        self.retry_after_ms = retry_after_ms
+        self.hint = hint
 
 
 plugin_hub_module.PluginHub = PluginHub
@@ -257,6 +267,103 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
             # Selection survives both paths.
             self.assertEqual(
                 middleware.get_active_instance(ctx), "ProjectA@aaa111")
+
+        asyncio.run(run_test())
+
+    def test_instances_resource_exempt_from_unreachable_guard(self):
+        class ContextState(SimpleNamespace):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.state = {}
+
+            def set_state(self, key, value):
+                self.state[key] = value
+
+        class MiddlewareContext:
+            def __init__(self, fastmcp_context, message=None):
+                self.fastmcp_context = fastmcp_context
+                self.message = message
+
+        async def run_test():
+            middleware = UnityInstanceMiddleware()
+            middleware._is_http_transport = lambda: True
+            ctx = ContextState(
+                client_id="client-a",
+                session_id=None,
+                request_context=None,
+            )
+            middleware.set_active_instance(ctx, "ProjectA@aaa111")
+            old_plugin_hub = unity_instance_middleware.PluginHub
+            unity_instance_middleware.PluginHub = PluginHub
+            PluginHub.configured = True
+            try:
+                # Resource messages carry `.uri` instead of `.name`. The instance
+                # listing is the enumeration entry point that set_active_instance's
+                # own error text points to, so it must stay readable even when the
+                # stored selection is dead.
+                await middleware._inject_unity_instance(
+                    MiddlewareContext(ctx, SimpleNamespace(uri="mcpforunity://instances")))
+                # AnyUrl normalization may add a trailing slash; that form must
+                # also be recognized.
+                await middleware._inject_unity_instance(
+                    MiddlewareContext(ctx, SimpleNamespace(uri="mcpforunity://instances/")))
+
+                # Other resources still fail fast as retryable.
+                with self.assertRaises(unity_instance_middleware.PluginDisconnectedError):
+                    await middleware._inject_unity_instance(
+                        MiddlewareContext(ctx, SimpleNamespace(uri="mcpforunity://custom-tools")))
+            finally:
+                PluginHub.configured = False
+                unity_instance_middleware.PluginHub = old_plugin_hub
+
+            # Selection survives both paths.
+            self.assertEqual(
+                middleware.get_active_instance(ctx), "ProjectA@aaa111")
+
+        asyncio.run(run_test())
+
+    def test_unreachable_error_carries_classification_fields(self):
+        class ContextState(SimpleNamespace):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.state = {}
+
+            def set_state(self, key, value):
+                self.state[key] = value
+
+        class MiddlewareContext:
+            def __init__(self, fastmcp_context, message=None):
+                self.fastmcp_context = fastmcp_context
+                self.message = message
+
+        async def run_test():
+            middleware = UnityInstanceMiddleware()
+            middleware._is_http_transport = lambda: True
+            ctx = ContextState(
+                client_id="client-a",
+                session_id=None,
+                request_context=None,
+            )
+            middleware.set_active_instance(ctx, "ProjectA@aaa111")
+            old_plugin_hub = unity_instance_middleware.PluginHub
+            unity_instance_middleware.PluginHub = PluginHub
+            PluginHub.configured = True
+            try:
+                with self.assertRaises(unity_instance_middleware.PluginDisconnectedError) as caught:
+                    await middleware._inject_unity_instance(
+                        MiddlewareContext(ctx, SimpleNamespace(name="manage_scene")))
+            finally:
+                PluginHub.configured = False
+                unity_instance_middleware.PluginHub = old_plugin_hub
+
+            exc = caught.exception
+            # Raise-style paths must expose the same machine-readable contract as
+            # classified_error_response on the send_command path.
+            self.assertEqual(exc.code, "unity_instance_unreachable")
+            self.assertEqual(exc.category, "session")
+            self.assertIs(exc.retryable, True)
+            self.assertEqual(exc.retry_after_ms, 2000)
+            self.assertEqual(exc.hint, "retry")
 
         asyncio.run(run_test())
 

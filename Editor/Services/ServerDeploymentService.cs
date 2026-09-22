@@ -17,6 +17,10 @@ namespace MCPForUnity.Editor.Services
     {
         private const string PackageServerFolderName = "Server~";
 
+        // 部署完成标记：拷贝全部完成后才写入（内容为版本号）。中途崩溃的同步
+        // 不会留下它，因此"版本号一致但半拷贝"的树能被指纹检出并自愈。
+        private const string DeployStampFileName = ".mcp-deploy-stamp";
+
         // Directory names never copied from the package and never deleted from the project
         // (.venv is preserved on resync so dependencies do not need a full reinstall).
         private static readonly string[] ExcludedDirectoryNames = { ".venv", "__pycache__", ".pytest_cache", "build" };
@@ -81,7 +85,7 @@ namespace MCPForUnity.Editor.Services
 
             try
             {
-                SyncServerSources(bundledPath, projectPath);
+                SyncServerSources(bundledPath, projectPath, bundledVersion);
                 message = $"已自动部署/同步 MCP Server 源码到 {projectPath}（版本 {bundledVersion}）。";
                 McpLog.Info(message);
                 return true;
@@ -98,6 +102,8 @@ namespace MCPForUnity.Editor.Services
         /// Minimal integrity fingerprint: a deploy interrupted mid-copy (crash, disk
         /// full, killed editor) can leave a version-matching but incomplete tree,
         /// which would otherwise never self-heal because the versions compare equal.
+        /// The stamp file is written only after the full copy completes, and the
+        /// delete phase removes it first — so its presence proves completeness.
         /// </summary>
         private static bool IsDeploymentComplete(string projectPath)
         {
@@ -109,7 +115,8 @@ namespace MCPForUnity.Editor.Services
                 && Directory.Exists(Path.Combine(projectPath, "src", "services"))
                 && Directory.Exists(Path.Combine(projectPath, "src", "transport"))
                 && Directory.Exists(Path.Combine(projectPath, "src", "utils"))
-                && Directory.Exists(Path.Combine(projectPath, "tests"));
+                && Directory.Exists(Path.Combine(projectPath, "tests"))
+                && File.Exists(Path.Combine(projectPath, DeployStampFileName));
         }
 
         /// <summary>
@@ -127,7 +134,7 @@ namespace MCPForUnity.Editor.Services
         /// Everything else under the target is deleted first so removed files cannot
         /// linger as ghost tools/resources (the server auto-discovers .py files).
         /// </summary>
-        private static void SyncServerSources(string sourceRoot, string targetRoot)
+        private static void SyncServerSources(string sourceRoot, string targetRoot, string version)
         {
             Directory.CreateDirectory(targetRoot);
 
@@ -158,6 +165,9 @@ namespace MCPForUnity.Editor.Services
 
             CopyDirectoryFiltered(sourceRoot, targetRoot);
             WriteGitignoreIfMissing(targetRoot);
+
+            // 完成标记最后写入：同步中途崩溃时标记缺失，下次启动指纹检出半拷贝并自愈
+            File.WriteAllText(Path.Combine(targetRoot, DeployStampFileName), version + "\n");
         }
 
         /// <summary>
@@ -219,7 +229,7 @@ namespace MCPForUnity.Editor.Services
 
             try
             {
-                File.WriteAllText(gitignorePath, ".venv/\n__pycache__/\n*.egg-info\nbuild/\n");
+                File.WriteAllText(gitignorePath, ".venv/\n__pycache__/\n*.egg-info\nbuild/\n" + DeployStampFileName + "\n");
             }
             catch (Exception ex)
             {

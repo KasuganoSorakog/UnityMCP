@@ -318,6 +318,40 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         }
 
         /// <summary>
+        /// 放弃重连后的残留清理。与 EstablishConnectionAsync 抢同一把 _connectLock，
+        /// 并且只在共享字段仍归本次重连所有时才清理——否则会把 StartAsync 在锁内
+        /// 刚建好的 socket/CTS 拆掉（症状：面板显示"已连接"，实际 socket 已死）。
+        /// </summary>
+        private async Task CleanupAbandonedReconnectAsync()
+        {
+            try
+            {
+                await _connectLock.WaitAsync().ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Dispose 期间放弃清理
+                return;
+            }
+
+            try
+            {
+                if (_isConnected || _superseded)
+                {
+                    // 手动连接已成功，或被顶替路径已自行处理 socket：
+                    // 共享字段不归本次重连所有，不动它们
+                    return;
+                }
+
+                await CleanupFailedConnectionAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _connectLock.Release();
+            }
+        }
+
+        /// <summary>
         /// Stops the connection loops and disposes of the connection CTS.
         /// Particularly useful when reconnecting, we want to ensure that background loops are cancelled correctly before starting new oens
         /// </summary>
@@ -532,7 +566,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 {
                     if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
                     {
-                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Superseded", CancellationToken.None).ConfigureAwait(false);
+                        // 有界等待：与 CleanupFailedConnectionAsync 对齐。对端在发出 supersede
+                        // 后恰好死亡时，CloseAsync(None) 会无限挂起接收循环任务，进而堵死
+                        // _connectLock 持锁路径上的 StopConnectionLoopsAsync（Connect 按钮失灵）
+                        using var closeTimeoutCts = new CancellationTokenSource(CloseHandshakeTimeout);
+                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Superseded", closeTimeoutCts.Token).ConfigureAwait(false);
                     }
                 }
                 catch { }
@@ -930,8 +968,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         {
             try
             {
-                await StopConnectionLoopsAsync().ConfigureAwait(false);
-
+                // 首轮前的残留停清由 EstablishConnectionAsync 在 _connectLock 内完成
+                // （其首步即 StopConnectionLoopsAsync），此处不再做锁外重复清理，
+                // 避免误伤 StartAsync 并发新建的连接 CTS。
                 int attempt = 0;
                 while (!token.IsCancellationRequested && !_superseded && McpProjectSettings.GetAutoReconnect())
                 {
@@ -952,7 +991,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
                 // 放弃重连（重试耗尽/被顶替/自动重连被关闭）：完整清理残留，
                 // 避免僵尸连接在服务端断连时再触发一轮无效重连
-                await CleanupFailedConnectionAsync().ConfigureAwait(false);
+                await CleanupAbandonedReconnectAsync().ConfigureAwait(false);
 
                 if (!_superseded)
                 {

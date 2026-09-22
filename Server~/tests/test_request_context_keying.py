@@ -30,7 +30,15 @@ class PluginHub:
 
 
 class PluginDisconnectedError(RuntimeError):
-    pass
+    """Mirror of the real class (see test_plugin_disconnected_error.py)."""
+
+    def __init__(self, message, *, code=None, category=None, retryable=None, retry_after_ms=None, hint=None):
+        super().__init__(message)
+        self.code = code
+        self.category = category
+        self.retryable = retryable
+        self.retry_after_ms = retry_after_ms
+        self.hint = hint
 
 
 plugin_hub_module.PluginHub = PluginHub
