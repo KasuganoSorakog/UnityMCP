@@ -321,6 +321,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         /// 放弃重连后的残留清理。与 EstablishConnectionAsync 抢同一把 _connectLock，
         /// 并且只在共享字段仍归本次重连所有时才清理——否则会把 StartAsync 在锁内
         /// 刚建好的 socket/CTS 拆掉（症状：面板显示"已连接"，实际 socket 已死）。
+        /// 归属判断分两层：先查 _isConnected/_superseded，再查 _connectionCts 活性，
+        /// 堵住 _isConnected 在锁外才置位的窄窗。
         /// </summary>
         private async Task CleanupAbandonedReconnectAsync()
         {
@@ -336,10 +338,31 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             try
             {
+                // 第一层归属判断：连接已成功，或被顶替路径已自行处理 socket
                 if (_isConnected || _superseded)
                 {
-                    // 手动连接已成功，或被顶替路径已自行处理 socket：
                     // 共享字段不归本次重连所有，不动它们
+                    return;
+                }
+
+                // 第二层活性判断：_isConnected 在 EstablishConnectionAsync 释放 _connectLock
+                // 之后才置位（StartAsync/AttemptReconnectAsync），单靠第一层会留窄窗。
+                // 重连放弃路径上自己的 CTS 已随失败清理被 cancel/dispose，因此一个未取消的
+                // _connectionCts 说明另一条路径（StartAsync）已建好或正在建新连接——
+                // 共享字段不归本次清理所有。
+                bool connectionCtsActive;
+                try
+                {
+                    connectionCtsActive = _connectionCts != null && !_connectionCts.IsCancellationRequested;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // CTS 已被 Dispose 视为已取消，继续清理
+                    connectionCtsActive = false;
+                }
+
+                if (connectionCtsActive)
+                {
                     return;
                 }
 

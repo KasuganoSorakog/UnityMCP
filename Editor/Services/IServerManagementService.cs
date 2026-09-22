@@ -41,6 +41,14 @@ namespace MCPForUnity.Editor.Services
         bool IsLocalHttpServerRunning();
 
         /// <summary>
+        /// Check whether the running local MCP HTTP server reports the same version as this
+        /// package (via the unauthenticated GET /plugin/diagnostics endpoint). Any failure to
+        /// determine the version (unreachable, timeout, non-2xx, unparsable response) is
+        /// treated as incompatible, so callers should restart the server to load fresh code.
+        /// </summary>
+        bool IsRunningServerVersionCompatible();
+
+        /// <summary>
         /// Attempts to get the command that will be executed when starting the local HTTP server
         /// </summary>
         /// <param name="command">The command that will be executed when available</param>

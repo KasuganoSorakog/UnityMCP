@@ -129,10 +129,14 @@ class PluginHub(WebSocketEndpoint):
     # "already running" (execution state unknown). Overridable via
     # UNITY_MCP_CANCEL_ACK_GRACE_SECONDS.
     CANCEL_ACK_GRACE_SECONDS = 2.0
-    # Upper bound for sending the RegisteredMessage while holding the global
-    # register lock: a stuck/half-open socket must not block every other
-    # project's registration forever.
-    REGISTER_ACK_SEND_TIMEOUT_SECONDS = 10.0
+    # Upper bound for sending the RegisteredMessage while holding the per-hash
+    # register lock: a stuck/half-open socket must not stall re-registration of
+    # the same project for long. Must stay well below the Unity client's 10s
+    # RegistrationTimeout so that (a) the client still has round-trip headroom
+    # to receive the ack before giving up, and (b) a stuck first registration
+    # cannot push a queued re-registration of the same hash past the client
+    # timeout.
+    REGISTER_ACK_SEND_TIMEOUT_SECONDS = 5.0
     # Fast-path commands should never block the client for long; return a retry hint instead.
     # This helps avoid the Cursor-side ~30s tool-call timeout when Unity is compiling/reloading
     # or is throttled while unfocused.
@@ -144,10 +148,22 @@ class PluginHub(WebSocketEndpoint):
     # command_id -> {"future": Future, "session_id": str}
     _pending: dict[str, dict[str, Any]] = {}
     _lock: asyncio.Lock | None = None
-    # Serializes _handle_register so concurrent re-registrations of the same
-    # project hash cannot interleave register/connection-insert and both
-    # believe they own the hash.
-    _register_lock: asyncio.Lock | None = None
+    # Per-project-hash locks serializing _handle_register: concurrent
+    # re-registrations of the same hash cannot interleave register/
+    # connection-insert and both believe they own the hash. Sharded by hash so
+    # a stuck registration for one project never blocks other projects'
+    # editors from registering.
+    _register_locks: dict[str, asyncio.Lock] = {}
+    # Guards get/create/prune of _register_locks so one hash never ends up
+    # with two live lock objects.
+    _register_locks_guard: asyncio.Lock | None = None
+    # Session ids whose supersede eviction is in flight: the replacement
+    # session already owns the project hash, but the old socket has not been
+    # notified/closed yet. The orphan sweep must skip these so the old client
+    # receives its session_superseded notification instead of a bare 4408
+    # close — without the notification it would auto-reconnect and the two
+    # editors would keep superseding each other (ping-pong).
+    _eviction_in_progress: set[str] = set()
     _loop: asyncio.AbstractEventLoop | None = None
     _scheduler: InstanceCommandScheduler | None = None
     _sweeper_task: asyncio.Task | None = None
@@ -160,9 +176,14 @@ class PluginHub(WebSocketEndpoint):
     ) -> None:
         cls._registry = registry
         cls._loop = loop or asyncio.get_running_loop()
-        # Ensure coordination primitives are bound to the configured loop
+        # Ensure coordination primitives are bound to the configured loop.
+        # Reconfiguration swaps the registry as well, so in-flight work cannot
+        # rely on old locks/marks surviving; recreating them here (and only
+        # here) keeps mutual exclusion intact.
         cls._lock = asyncio.Lock()
-        cls._register_lock = asyncio.Lock()
+        cls._register_locks = {}
+        cls._register_locks_guard = asyncio.Lock()
+        cls._eviction_in_progress = set()
         cls._scheduler = InstanceCommandScheduler()
 
     @classmethod
@@ -170,9 +191,27 @@ class PluginHub(WebSocketEndpoint):
         return (
             cls._registry is not None
             and cls._lock is not None
-            and cls._register_lock is not None
+            and cls._register_locks_guard is not None
             and cls._scheduler is not None
         )
+
+    @classmethod
+    async def _register_lock_for(cls, project_hash: str) -> asyncio.Lock:
+        """Return the per-hash registration lock, creating it under the guard.
+
+        Callers must enter the returned lock without any intervening await so
+        the sweeper's lock pruning cannot drop it while it is about to be
+        acquired.
+        """
+        guard = cls._register_locks_guard
+        if guard is None:
+            raise RuntimeError("PluginHub not configured")
+        async with guard:
+            lock = cls._register_locks.get(project_hash)
+            if lock is None:
+                lock = asyncio.Lock()
+                cls._register_locks[project_hash] = lock
+            return lock
 
     async def on_connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -666,8 +705,7 @@ class PluginHub(WebSocketEndpoint):
         cls = type(self)
         registry = cls._registry
         lock = cls._lock
-        register_lock = cls._register_lock
-        if registry is None or lock is None or register_lock is None:
+        if registry is None or lock is None or cls._register_locks_guard is None:
             await websocket.close(code=1011)
             raise RuntimeError("PluginHub not configured")
 
@@ -682,13 +720,17 @@ class PluginHub(WebSocketEndpoint):
 
         session_id = str(uuid.uuid4())
 
-        # Serialize the whole lookup/register/insert/notify sequence: two
-        # editors reconnecting the same project hash concurrently must not
-        # interleave, or both ends can believe they own the hash and keep
-        # superseding each other.
+        # Serialize the whole lookup/register/insert/notify sequence per
+        # project hash: two editors reconnecting the same hash concurrently
+        # must not interleave, or both ends can believe they own the hash and
+        # keep superseding each other. Different hashes take different locks,
+        # so a stuck registration for one project cannot block the others.
+        # (No await between _register_lock_for and `async with`: the sweeper's
+        # lock pruning must not see this lock as unheld.)
         previous_session_id: str | None = None
         previous_websocket: WebSocket | None = None
         previous_session = None
+        register_lock = await cls._register_lock_for(project_hash)
         async with register_lock:
             candidate_id = await registry.get_session_id_by_hash(project_hash)
             if candidate_id:
@@ -697,6 +739,13 @@ class PluginHub(WebSocketEndpoint):
                 if candidate_ws is not None and candidate_ws is not websocket:
                     previous_session_id = candidate_id
                     previous_websocket = candidate_ws
+                    # Mark before registry.register() below drops the old
+                    # record: until _evict_superseded_session finishes, the
+                    # orphan sweep must not treat this socket as a stray and
+                    # close it with 4408 — the old client needs its
+                    # session_superseded notification (else it auto-reconnects
+                    # and the two editors ping-pong).
+                    cls._eviction_in_progress.add(candidate_id)
                     # Captured for rollback: register() below atomically drops
                     # the old record, so restoring it needs the original data.
                     previous_session = await registry.get_session(candidate_id)
@@ -721,7 +770,8 @@ class PluginHub(WebSocketEndpoint):
                 cls._connections[session.session_id] = websocket
 
             # Inform the plugin of its assigned session ID. Bounded wait: a
-            # stuck socket must not hold the (global) register lock forever.
+            # stuck socket must not hold the per-hash register lock past the
+            # client's own registration timeout.
             # If the socket is already dying, roll back the new session and
             # restore the superseded one so the project keeps a usable session.
             response = RegisteredMessage(session_id=session_id)
@@ -732,6 +782,11 @@ class PluginHub(WebSocketEndpoint):
                 )
             except Exception:
                 await cls._cleanup_session_locked(session_id)
+                # The eviction below never runs on this path, so the old socket
+                # is not being superseded after all; drop the mark with the
+                # rollback (the restored session owns the socket again).
+                if previous_session_id is not None:
+                    cls._eviction_in_progress.discard(previous_session_id)
                 if previous_session is not None:
                     restored = await registry.register(
                         previous_session.session_id,
@@ -864,51 +919,56 @@ class PluginHub(WebSocketEndpoint):
         # re-registered on the same socket while we were outside the register
         # lock, and closing it now would kill that live session. (In that path
         # the old session was already cleaned up during re-registration.)
-        lock = cls._lock
-        if lock is not None:
-            async with lock:
-                socket_reused = any(
-                    sid != previous_session_id and ws is previous_websocket
-                    for sid, ws in cls._connections.items()
-                )
-            if socket_reused:
-                logger.info(
-                    "Skipping eviction close for session %s: its socket was re-registered by a newer session",
-                    previous_session_id,
-                )
-                return
+        try:
+            lock = cls._lock
+            if lock is not None:
+                async with lock:
+                    socket_reused = any(
+                        sid != previous_session_id and ws is previous_websocket
+                        for sid, ws in cls._connections.items()
+                    )
+                if socket_reused:
+                    logger.info(
+                        "Skipping eviction close for session %s: its socket was re-registered by a newer session",
+                        previous_session_id,
+                    )
+                    return
 
-        logger.info(
-            "Project hash %s re-registered by a new connection; superseding session %s",
-            project_hash,
-            previous_session_id,
-        )
-        try:
-            await previous_websocket.send_json({
-                "type": "session_superseded",
-                "reason": "duplicate_project_hash",
-                "project_hash": project_hash,
-                "project_name": project_name,
-            })
-        except Exception:
-            logger.debug(
-                "Failed to notify superseded session %s",
+            logger.info(
+                "Project hash %s re-registered by a new connection; superseding session %s",
+                project_hash,
                 previous_session_id,
-                exc_info=True,
             )
-        try:
-            # Bounded wait: the old editor may be frozen and never answer.
-            await asyncio.wait_for(
-                previous_websocket.close(code=cls.CLOSE_CODE_SESSION_SUPERSEDED),
-                timeout=3.0,
-            )
-        except Exception:
-            logger.debug(
-                "Failed to close superseded websocket for session %s",
-                previous_session_id,
-                exc_info=True,
-            )
-        await cls._cleanup_session_locked(previous_session_id)
+            try:
+                await previous_websocket.send_json({
+                    "type": "session_superseded",
+                    "reason": "duplicate_project_hash",
+                    "project_hash": project_hash,
+                    "project_name": project_name,
+                })
+            except Exception:
+                logger.debug(
+                    "Failed to notify superseded session %s",
+                    previous_session_id,
+                    exc_info=True,
+                )
+            try:
+                # Bounded wait: the old editor may be frozen and never answer.
+                await asyncio.wait_for(
+                    previous_websocket.close(code=cls.CLOSE_CODE_SESSION_SUPERSEDED),
+                    timeout=3.0,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to close superseded websocket for session %s",
+                    previous_session_id,
+                    exc_info=True,
+                )
+            await cls._cleanup_session_locked(previous_session_id)
+        finally:
+            # Win or lose, the supersede window is over: the orphan sweep may
+            # treat this socket as a stray again from here on.
+            cls._eviction_in_progress.discard(previous_session_id)
 
     # ------------------------------------------------------------------
     # Stale session sweeper
@@ -1021,6 +1081,14 @@ class PluginHub(WebSocketEndpoint):
             async with lock:
                 connected = dict(cls._connections)
             for session_id, websocket in connected.items():
+                if session_id in cls._eviction_in_progress:
+                    # A supersede eviction is in flight for this socket (old
+                    # registry record already dropped by the replacement's
+                    # register()). Leave it alone so the old client receives
+                    # its session_superseded notification and 4409 close
+                    # instead of a bare 4408 — otherwise it would
+                    # auto-reconnect and supersede back (ping-pong).
+                    continue
                 if await registry.get_session(session_id) is not None:
                     continue
                 logger.warning(
@@ -1035,6 +1103,21 @@ class PluginHub(WebSocketEndpoint):
                 except Exception:
                     pass
                 await cls._cleanup_session_locked(session_id)
+
+        # Prune per-hash register locks whose project has no live session, so
+        # a long-running server does not accumulate locks for closed projects.
+        # Only locks not currently held are removed, and only under the guard,
+        # so a registration in flight always keeps its lock.
+        guard = cls._register_locks_guard
+        if guard is not None:
+            active_hashes = {
+                session.project_hash
+                for session in (await registry.list_sessions()).values()
+            }
+            async with guard:
+                for hash_value, register_lock in list(cls._register_locks.items()):
+                    if hash_value not in active_hashes and not register_lock.locked():
+                        cls._register_locks.pop(hash_value, None)
         return evicted
 
     @classmethod

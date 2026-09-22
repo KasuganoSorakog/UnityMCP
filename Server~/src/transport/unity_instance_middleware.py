@@ -6,12 +6,17 @@ into the request-scoped state, allowing tools to access it via ctx.get_state("un
 """
 from collections import OrderedDict
 from threading import RLock
+import json
 import logging
 from typing import Any
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-from transport.plugin_hub import PluginHub, PluginDisconnectedError
+from transport.plugin_hub import (
+    PluginHub,
+    PluginDisconnectedError,
+    classified_error_response,
+)
 
 logger = logging.getLogger("mcp-for-unity-server")
 
@@ -48,6 +53,61 @@ def _mapping_value(mapping: dict[str, Any], *keys: str) -> Any:
         if key in mapping:
             return mapping[key]
     return None
+
+
+def _classified_error_payload(exc: PluginDisconnectedError) -> dict[str, Any]:
+    """Map a classified guard exception onto the send_command-path error shape.
+
+    Falls back to the middleware's own classification when the exception does
+    not carry a field, so the client always receives the full contract.
+    """
+    return classified_error_response(
+        code=exc.code or "unity_instance_unreachable",
+        category=exc.category or "session",
+        error=str(exc),
+        retryable=bool(exc.retryable),
+        retry_after_ms=exc.retry_after_ms,
+        hint=exc.hint,
+    )
+
+
+def _classified_tool_result(exc: PluginDisconnectedError) -> Any:
+    """Serialize a classified guard error as a normal tool result.
+
+    FastMCP's default error path would only forward the exception message
+    text; the send_command path instead returns a classified JSON payload the
+    client (AI) parses. Returning it as a regular tool result keeps both paths
+    machine-readable in exactly the same shape.
+
+    Imports are lazy: unit tests stub the fastmcp modules, so importing
+    fastmcp.tools at module import time would break the stub pattern.
+    """
+    from mcp.types import TextContent
+    from fastmcp.tools.tool import ToolResult
+
+    payload = _classified_error_payload(exc)
+    return ToolResult(
+        content=[TextContent(
+            type="text",
+            text=json.dumps(payload, ensure_ascii=False),
+        )],
+        structured_content=payload,
+    )
+
+
+def _classified_resource_result(exc: PluginDisconnectedError) -> Any:
+    """Serialize a classified guard error as resource contents.
+
+    Same rationale as _classified_tool_result: resource readers receive the
+    classified JSON payload instead of a bare protocol error message.
+    """
+    from mcp.server.lowlevel.helper_types import ReadResourceContents
+
+    payload = _classified_error_payload(exc)
+    return [ReadResourceContents(
+        content=json.dumps(payload, ensure_ascii=False),
+        mime_type="application/json",
+    )]
 
 
 def _extract_workspace_roots(codex_meta: dict[str, Any]) -> list[str]:
@@ -557,11 +617,35 @@ class UnityInstanceMiddleware(Middleware):
                 ctx.set_state("unity_session_id", session_id)
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        """Inject active Unity instance into tool context if available."""
-        await self._inject_unity_instance(context)
-        return await call_next(context)
+        """Inject active Unity instance into tool context if available.
+
+        A classified PluginDisconnectedError (dead stored selection) becomes a
+        normal tool result carrying the classified JSON payload — the same
+        shape send_command-path errors use — instead of a protocol-level error
+        that only forwards the message text.
+        """
+        try:
+            await self._inject_unity_instance(context)
+            return await call_next(context)
+        except PluginDisconnectedError as exc:
+            logger.info(
+                "Failing tool call as retryable classified result: %s",
+                exc.code or "unity_instance_unreachable",
+            )
+            return _classified_tool_result(exc)
 
     async def on_read_resource(self, context: MiddlewareContext, call_next):
-        """Inject active Unity instance into resource context if available."""
-        await self._inject_unity_instance(context)
-        return await call_next(context)
+        """Inject active Unity instance into resource context if available.
+
+        Classified guard errors are returned as resource contents holding the
+        same classified JSON payload as the tool path.
+        """
+        try:
+            await self._inject_unity_instance(context)
+            return await call_next(context)
+        except PluginDisconnectedError as exc:
+            logger.info(
+                "Failing resource read as retryable classified result: %s",
+                exc.code or "unity_instance_unreachable",
+            )
+            return _classified_resource_result(exc)

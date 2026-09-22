@@ -195,8 +195,6 @@ namespace MCPForUnity.Editor.Services
         private const int ServerReadyTimeoutMs = 30000;
 
         private static bool running;
-        // 已拉起服务端进程、等待端口绑定中：此期间不再重复 spawn，避免多进程堆积抢 8080
-        private static bool serverLaunchPending;
 
         static CentralServerAutoConnect()
         {
@@ -258,24 +256,20 @@ namespace MCPForUnity.Editor.Services
                         return;
                     }
 
-                    bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning();
+                    bool serverReady = MCPServiceLocator.Server.IsLocalHttpServerRunning()
+                        && await Task.Run(() => MCPServiceLocator.Server.IsRunningServerVersionCompatible());
                     if (!serverReady)
                     {
-                        if (!serverLaunchPending)
+                        // 未运行或版本不兼容时（重新）拉起；版本过旧时 StartLocalHttpServerQuiet
+                        // 内部会先停掉旧 Server 再启动，防重入由其自身的端口检查承担
+                        bool launchRequested = MCPServiceLocator.Server.StartLocalHttpServerQuiet();
+                        if (!launchRequested)
                         {
-                            bool launchRequested = MCPServiceLocator.Server.StartLocalHttpServerQuiet();
-                            if (!launchRequested)
-                            {
-                                await DelayBeforeRetryAsync(attempt);
-                                continue;
-                            }
-
-                            serverLaunchPending = true;
+                            await DelayBeforeRetryAsync(attempt);
+                            continue;
                         }
 
                         serverReady = await WaitForServerReadyAsync();
-                        // 本轮绑定等待结束（成功或超时）：清除标记，超时未就绪则下一轮重试允许重新拉起
-                        serverLaunchPending = false;
                     }
 
                     if (!serverReady)

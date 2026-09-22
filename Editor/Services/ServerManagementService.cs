@@ -1,12 +1,15 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
+using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
 
@@ -437,8 +440,16 @@ namespace MCPForUnity.Editor.Services
             // project from overwriting the runtime while the first server process is active.
             if (IsLocalHttpServerRunning())
             {
-                McpLog.Info("中心 MCP HTTP Server 已运行，复用现有 Server。");
-                return true;
+                if (IsRunningServerVersionCompatible())
+                {
+                    McpLog.Info("中心 MCP HTTP Server 已运行，复用现有 Server。");
+                    return true;
+                }
+
+                // 运行中的服务端版本与当前包不一致（包已升级但旧进程仍占用端口）：
+                // 停掉旧进程，继续走下方正常启动流程以加载新部署的服务端代码。
+                McpLog.Warn("中心 MCP HTTP Server 版本过旧，重启加载新服务端代码。");
+                StopLocalHttpServerInternal(quiet: true, allowNonLocalUrl: true);
             }
 
             /// Clean stale Python build artifacts when using a local dev server path
@@ -679,6 +690,48 @@ namespace MCPForUnity.Editor.Services
                 }
 
                 return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Check whether the running local MCP HTTP server matches this package's version.
+        /// Queries the unauthenticated GET /plugin/diagnostics endpoint and compares
+        /// server.version against AssetPathUtility.GetPackageVersion() (the two are
+        /// version-locked by convention). Any failure (unreachable, timeout, non-2xx,
+        /// unparsable or missing version field) is treated as incompatible so the
+        /// caller restarts the server and loads the newly deployed server code.
+        /// </summary>
+        public bool IsRunningServerVersionCompatible()
+        {
+            try
+            {
+                string baseUrl = HttpEndpointUtility.GetBaseUrl().TrimEnd('/');
+                using (var client = new HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromSeconds(3);
+                    // Task.Run 包裹后再同步阻塞：避免在 Unity 主线程直接 GetResult() 时
+                    // HttpClient 续体捕获 Editor SynchronizationContext 造成死锁。
+                    string body = Task.Run(() => client.GetStringAsync($"{baseUrl}/plugin/diagnostics"))
+                        .GetAwaiter().GetResult();
+                    string serverVersion = JObject.Parse(body)["server"]?["version"]?.ToString();
+                    string packageVersion = AssetPathUtility.GetPackageVersion();
+                    if (string.IsNullOrEmpty(serverVersion) || string.IsNullOrEmpty(packageVersion))
+                    {
+                        return false;
+                    }
+
+                    if (!string.Equals(serverVersion, packageVersion, StringComparison.Ordinal))
+                    {
+                        McpLog.Warn($"中心 MCP HTTP Server 版本不一致（运行中: {serverVersion}，当前包: {packageVersion}）。");
+                        return false;
+                    }
+
+                    return true;
+                }
             }
             catch
             {

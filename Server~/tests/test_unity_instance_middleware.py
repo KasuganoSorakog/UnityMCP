@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -21,6 +22,47 @@ fastmcp_middleware.MiddlewareContext = MiddlewareContext
 sys.modules.setdefault("fastmcp", ModuleType("fastmcp"))
 sys.modules.setdefault("fastmcp.server", ModuleType("fastmcp.server"))
 sys.modules["fastmcp.server.middleware"] = fastmcp_middleware
+
+# The middleware serializes classified guard errors via lazily-imported
+# fastmcp/mcp result types; stub them (only when the real modules are not
+# already loaded) so this file also works standalone.
+fastmcp_tools_tool = sys.modules.setdefault(
+    "fastmcp.tools.tool", ModuleType("fastmcp.tools.tool"))
+
+
+if not hasattr(fastmcp_tools_tool, "ToolResult"):
+    class ToolResult:
+        def __init__(self, content=None, structured_content=None, meta=None):
+            self.content = content
+            self.structured_content = structured_content
+            self.meta = meta
+
+    fastmcp_tools_tool.ToolResult = ToolResult
+
+mcp_types = sys.modules.setdefault("mcp.types", ModuleType("mcp.types"))
+
+
+if not hasattr(mcp_types, "TextContent"):
+    class TextContent:
+        def __init__(self, type="text", text=""):
+            self.type = type
+            self.text = text
+
+    mcp_types.TextContent = TextContent
+
+mcp_helper_types = sys.modules.setdefault(
+    "mcp.server.lowlevel.helper_types",
+    ModuleType("mcp.server.lowlevel.helper_types"))
+
+
+if not hasattr(mcp_helper_types, "ReadResourceContents"):
+    class ReadResourceContents:
+        def __init__(self, content, mime_type=None, meta=None):
+            self.content = content
+            self.mime_type = mime_type
+            self.meta = meta
+
+    mcp_helper_types.ReadResourceContents = ReadResourceContents
 
 plugin_hub_module = ModuleType("transport.plugin_hub")
 
@@ -51,8 +93,32 @@ class PluginDisconnectedError(RuntimeError):
         self.hint = hint
 
 
+def classified_error_response(*, code, category, error, severity="warning",
+                              retryable=False, retry_after_ms=None, hint=None,
+                              data=None):
+    """Mirror of transport.plugin_hub.classified_error_response (stubbed here
+    for the same reason as PluginDisconnectedError)."""
+    payload = dict(data or {})
+    payload.setdefault("reason", code)
+    if retry_after_ms is not None:
+        payload.setdefault("retry_after_ms", retry_after_ms)
+    return {
+        "success": False,
+        "message": None,
+        "error": error,
+        "data": payload or None,
+        "hint": hint,
+        "code": code,
+        "category": category,
+        "severity": severity,
+        "retryable": retryable,
+        "retry_after_ms": retry_after_ms,
+    }
+
+
 plugin_hub_module.PluginHub = PluginHub
 plugin_hub_module.PluginDisconnectedError = PluginDisconnectedError
+plugin_hub_module.classified_error_response = classified_error_response
 sys.modules["transport.plugin_hub"] = plugin_hub_module
 
 import transport.unity_instance_middleware as unity_instance_middleware
@@ -413,6 +479,152 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
             self.assertTrue(UnityInstanceMiddleware._is_http_transport())
             fake_unity_transport._current_transport = lambda: "stdio"
             self.assertFalse(UnityInstanceMiddleware._is_http_transport())
+
+    def _make_state_context(self):
+        class ContextState(SimpleNamespace):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.state = {}
+
+            def set_state(self, key, value):
+                self.state[key] = value
+
+        return ContextState(
+            client_id="client-a",
+            session_id=None,
+            request_context=None,
+        )
+
+    def test_on_call_tool_returns_classified_json_for_dead_selection(self):
+        async def run_test():
+            middleware = UnityInstanceMiddleware()
+            middleware._is_http_transport = lambda: True
+            ctx = self._make_state_context()
+            middleware.set_active_instance(ctx, "ProjectA@aaa111")
+            old_plugin_hub = unity_instance_middleware.PluginHub
+            unity_instance_middleware.PluginHub = PluginHub
+            PluginHub.configured = True
+            call_next_called = False
+
+            async def call_next(context):
+                nonlocal call_next_called
+                call_next_called = True
+                return "should-not-happen"
+
+            try:
+                context = SimpleNamespace(
+                    fastmcp_context=ctx,
+                    message=SimpleNamespace(name="manage_scene"),
+                )
+                result = await middleware.on_call_tool(context, call_next)
+            finally:
+                PluginHub.configured = False
+                unity_instance_middleware.PluginHub = old_plugin_hub
+
+            # The guard must short-circuit: call_next is never invoked, and the
+            # classified fields reach the client as JSON text content — the same
+            # shape send_command-path errors use.
+            self.assertFalse(call_next_called)
+            payload = json.loads(result.content[0].text)
+            self.assertFalse(payload["success"])
+            self.assertEqual(payload["code"], "unity_instance_unreachable")
+            self.assertEqual(payload["category"], "session")
+            self.assertIs(payload["retryable"], True)
+            self.assertEqual(payload["retry_after_ms"], 2000)
+            self.assertEqual(payload["hint"], "retry")
+            structured = getattr(result, "structured_content", None)
+            if structured is not None:
+                self.assertEqual(
+                    structured["code"], "unity_instance_unreachable")
+
+        asyncio.run(run_test())
+
+    def test_on_read_resource_returns_classified_json_for_dead_selection(self):
+        async def run_test():
+            middleware = UnityInstanceMiddleware()
+            middleware._is_http_transport = lambda: True
+            ctx = self._make_state_context()
+            middleware.set_active_instance(ctx, "ProjectA@aaa111")
+            old_plugin_hub = unity_instance_middleware.PluginHub
+            unity_instance_middleware.PluginHub = PluginHub
+            PluginHub.configured = True
+            call_next_called = False
+
+            async def call_next(context):
+                nonlocal call_next_called
+                call_next_called = True
+                return "should-not-happen"
+
+            try:
+                context = SimpleNamespace(
+                    fastmcp_context=ctx,
+                    message=SimpleNamespace(uri="mcpforunity://custom-tools"),
+                )
+                result = await middleware.on_read_resource(context, call_next)
+            finally:
+                PluginHub.configured = False
+                unity_instance_middleware.PluginHub = old_plugin_hub
+
+            self.assertFalse(call_next_called)
+            contents = list(result)
+            self.assertEqual(len(contents), 1)
+            payload = json.loads(contents[0].content)
+            self.assertFalse(payload["success"])
+            self.assertEqual(payload["code"], "unity_instance_unreachable")
+            self.assertEqual(payload["category"], "session")
+            self.assertIs(payload["retryable"], True)
+            self.assertEqual(payload["retry_after_ms"], 2000)
+            self.assertEqual(payload["hint"], "retry")
+
+        asyncio.run(run_test())
+
+    def test_on_call_tool_passes_through_when_no_dead_selection(self):
+        async def run_test():
+            middleware = UnityInstanceMiddleware()
+            middleware._is_http_transport = lambda: True
+            ctx = SimpleNamespace(
+                client_id="client-a", session_id=None, request_context=None)
+            call_next_called = False
+
+            async def call_next(context):
+                nonlocal call_next_called
+                call_next_called = True
+                return "tool-result"
+
+            context = SimpleNamespace(
+                fastmcp_context=ctx,
+                message=SimpleNamespace(name="manage_scene"),
+            )
+            result = await middleware.on_call_tool(context, call_next)
+            self.assertTrue(call_next_called)
+            self.assertEqual(result, "tool-result")
+
+        asyncio.run(run_test())
+
+    def test_classified_guard_reraises_non_classified_exceptions(self):
+        async def run_test():
+            middleware = UnityInstanceMiddleware()
+
+            async def broken_inject(context):
+                raise ValueError("unexpected failure")
+
+            middleware._inject_unity_instance = broken_inject
+
+            async def call_next(context):
+                return "should-not-happen"
+
+            context = SimpleNamespace(
+                fastmcp_context=SimpleNamespace(
+                    client_id="client-a", session_id=None, request_context=None),
+                message=SimpleNamespace(name="manage_scene"),
+            )
+            # Non-classified errors must still propagate unchanged.
+            with self.assertRaises(ValueError):
+                await middleware.on_call_tool(context, call_next)
+            with self.assertRaises(ValueError):
+                await middleware.on_read_resource(context, call_next)
+
+        asyncio.run(run_test())
 
 
 if __name__ == "__main__":

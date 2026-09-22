@@ -43,6 +43,32 @@ class PluginDisconnectedError(RuntimeError):
 
 plugin_hub_module.PluginHub = PluginHub
 plugin_hub_module.PluginDisconnectedError = PluginDisconnectedError
+
+
+def classified_error_response(*, code, category, error, severity="warning",
+                              retryable=False, retry_after_ms=None, hint=None,
+                              data=None):
+    """Mirror of transport.plugin_hub.classified_error_response (imported by
+    the middleware module, so the stub must provide it)."""
+    payload = dict(data or {})
+    payload.setdefault("reason", code)
+    if retry_after_ms is not None:
+        payload.setdefault("retry_after_ms", retry_after_ms)
+    return {
+        "success": False,
+        "message": None,
+        "error": error,
+        "data": payload or None,
+        "hint": hint,
+        "code": code,
+        "category": category,
+        "severity": severity,
+        "retryable": retryable,
+        "retry_after_ms": retry_after_ms,
+    }
+
+
+plugin_hub_module.classified_error_response = classified_error_response
 sys.modules["transport.plugin_hub"] = plugin_hub_module
 
 from transport.unity_instance_middleware import (

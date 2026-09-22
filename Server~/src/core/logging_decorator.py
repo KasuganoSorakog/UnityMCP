@@ -98,8 +98,11 @@ def log_execution(name: str, type_label: str):
                                 type_label, name, _format_payload(result))
                 return result
             except Exception as e:
-                logger.info("%s '%s' failed: %s",
-                            type_label, name, _format_payload(e))
+                # Failures must be diagnosable: ERROR level + full traceback.
+                # The payload itself stays capped via _format_payload.
+                logger.error("%s '%s' failed: %s",
+                             type_label, name, _format_payload(e),
+                             exc_info=True)
                 raise
 
         @functools.wraps(func)
@@ -115,8 +118,11 @@ def log_execution(name: str, type_label: str):
                                 type_label, name, _format_payload(result))
                 return result
             except Exception as e:
-                logger.info("%s '%s' failed: %s",
-                            type_label, name, _format_payload(e))
+                # Failures must be diagnosable: ERROR level + full traceback.
+                # The payload itself stays capped via _format_payload.
+                logger.error("%s '%s' failed: %s",
+                             type_label, name, _format_payload(e),
+                             exc_info=True)
                 raise
 
         return _async_wrapper if inspect.iscoroutinefunction(func) else _sync_wrapper
