@@ -36,7 +36,7 @@ Fork 自 [CoplayDev/unity-mcp](https://github.com/CoplayDev/unity-mcp)（MIT）�
    - 首次启动：自动把包内 `Server~/` 部署到 `<项目>/Tools/MCPForUnityServer`（排除 `.venv` 等运行产物），随后正常拉起。
    - 后续启动：直接使用项目内的服务端目录。
    - 包升级后（服务端 `version` 变化）：下次启动自动覆盖同步源码，`uv run --frozen` 会按新 `uv.lock` 自动补齐依赖。
-3. 中心 Server 以项目为单位路由会话；多个 Unity 项目可并行开启，各自连接自己的中心 Server，互不顶替（同项目重复连接才触发顶替通知）。
+3. 中心 Server 全机只有一个（占用 8080）；多个 Unity 项目可并行开启，都连接同一个中心 Server，按项目路由会话、互不顶替（同项目重复连接才触发顶替通知）。
 
 ### 首次启动的网络说明
 
