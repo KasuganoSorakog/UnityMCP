@@ -35,7 +35,7 @@ except Exception:
     pass
 
 from fastmcp import FastMCP
-from logging.handlers import RotatingFileHandler
+from core.logging_config import configure_server_logging
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import WebSocketRoute
@@ -44,6 +44,7 @@ from core.config import config
 from services.custom_tool_service import CustomToolService
 from transport.plugin_hub import PluginHub
 from transport.plugin_registry import PluginRegistry
+from services.state.connection_journal import ConnectionJournal
 from services.resources import register_all_resources
 from core.telemetry import get_package_version
 from services.tools import register_all_tools
@@ -64,25 +65,7 @@ logger = logging.getLogger("mcp-for-unity-server")
 
 # Also write logs to a rotating file so logs are available when launched via stdio
 try:
-    _log_dir = os.path.join(os.path.expanduser(
-        "~/Library/Application Support/UnityMCP"), "Logs")
-    os.makedirs(_log_dir, exist_ok=True)
-    _file_path = os.path.join(_log_dir, "unity_mcp_server.log")
-    _fh = RotatingFileHandler(
-        _file_path, maxBytes=512*1024, backupCount=2, encoding="utf-8")
-    _fh.setFormatter(logging.Formatter(config.log_format))
-    _fh.setLevel(getattr(logging, config.log_level))
-    logger.addHandler(_fh)
-    logger.propagate = False  # Prevent double logging to root logger
-    # Also route telemetry logger to the same rotating file and normal level
-    try:
-        tlog = logging.getLogger("unity-mcp-telemetry")
-        tlog.setLevel(getattr(logging, config.log_level))
-        tlog.addHandler(_fh)
-        tlog.propagate = False  # Prevent double logging for telemetry too
-    except Exception as exc:
-        # Never let logging setup break startup
-        logger.debug("Failed to configure telemetry logger", exc_info=exc)
+    configure_server_logging(logger, config.log_format, getattr(logging, config.log_level))
 except Exception as exc:
     # Never let logging setup break startup
     logger.debug("Failed to configure main logger file handler", exc_info=exc)
@@ -124,7 +107,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
     global _plugin_registry
     if _plugin_registry is None:
-        _plugin_registry = PluginRegistry()
+        _plugin_registry = PluginRegistry(journal=ConnectionJournal())
         loop = asyncio.get_running_loop()
         PluginHub.configure(_plugin_registry, loop)
     # Start the stale-session sweeper (idempotent; harmless in stdio mode
@@ -170,6 +153,8 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         }
     finally:
         await PluginHub.stop_session_sweeper()
+        if _plugin_registry is not None:
+            _plugin_registry.close_journal()
         if _unity_connection_pool:
             _unity_connection_pool.disconnect_all()
         logger.info("MCP for Unity Server shut down")
@@ -188,6 +173,14 @@ Targeting Unity instances:
 - Use the resource mcpforunity://instances to list active Unity sessions (Name@hash).
 - When multiple instances are connected, call set_active_instance with the exact Name@hash before using tools/resources. The server will error if multiple are connected and no active instance is set.
 
+Health, leases and long operations:
+- Call `health` once at the start of a session instead of probing with "hello": it reports project paths, package/server version skew, compilation and Play state, command queues, write leases and recent disconnect reasons per instance.
+- Before mutating a project (scene, assets, components, tags/layers, Play state), call `claim_instance(action="claim", owner="task name")`; the lease owner is the server-side session identity and `owner` is only a display label. Release it when done. Blocked writes return `unity_instance_busy` with the holder; read-only tools always work.
+- `manage_editor(action="play"|"stop", wait_for_completion=true)` waits for the state change to land. If the request is cut off by a client timeout or a domain reload, query it with `manage_editor(action="operation_status", operation_id=...)` — never re-send play/stop.
+- `sample_runtime` only samples an existing Play session and never enters Play itself. If Play exits or Unity reloads, it returns `partial=true`; fetch the saved frames later with `action="result"` and the returned `sample_id`.
+- Screenshots (`capture_view`, `manage_scene(action="screenshot")`) are written to `<project>/Library/MCPScreenshots/` and returned as absolute paths. They are not imported into `Assets/`. Read the returned file before claiming a capture succeeded.
+- Read probe output with `read_console(filter_text="[Probe]", since_timestamp=<time Play started>)` plus `types` and paging, instead of pulling the whole console. `since_timestamp` is served from an in-editor timestamped mirror, so it only covers logs after the last domain reload (`coverage_start_utc` / `possibly_incomplete` say how far back it reaches). `regex` (max 200 chars, 1s per-match guard) is supported on `read_console` and `manage_asset(action="search")`.
+
 Important Workflows:
 
 Resources vs Tools:
@@ -198,7 +191,8 @@ Resources vs Tools:
 Script Management:
 - After creating or modifying scripts (by your own tools or the `manage_script` tool) use `read_console` to check for compilation errors before proceeding
 - Only after successful compilation can new components/types be used
-- You can poll the `editor_state` resource's `isCompiling` field to check if the domain reload is complete
+- You can poll the `editor_state` resource's `compilation.is_compiling` and
+  `compilation.is_domain_reload_pending` fields to check whether a domain reload is done
 
 Scene Setup:
 - Always include a Camera and main Light (Directional Light) in new scenes

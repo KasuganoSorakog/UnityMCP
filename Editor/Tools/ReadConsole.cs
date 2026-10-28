@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using MCPForUnity.Editor.Helpers; // For Response class
+using MCPForUnity.Editor.Services;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEditorInternal;
@@ -177,7 +179,9 @@ namespace MCPForUnity.Editor.Tools
                         ?? @params["page_size"]?.ToObject<int?>();
                     int? cursor = @params["cursor"]?.ToObject<int?>();
                     string filterText = @params["filterText"]?.ToString();
-                    string sinceTimestampStr = @params["sinceTimestamp"]?.ToString(); // TODO: Implement timestamp filtering
+                    string filterRegex =
+                        @params["regex"]?.ToString() ?? @params["filterRegex"]?.ToString();
+                    string sinceTimestampStr = @params["sinceTimestamp"]?.ToString();
                     string format = (@params["format"]?.ToString() ?? "plain").ToLower();
                     bool includeStacktrace =
                         @params["includeStacktrace"]?.ToObject<bool?>() ?? false;
@@ -201,12 +205,47 @@ namespace MCPForUnity.Editor.Tools
                         types = new List<string> { "error", "warning", "log" }; // Expand 'all'
                     }
 
+                    TextFilter textFilter;
+                    try
+                    {
+                        textFilter = new TextFilter(filterText, filterRegex);
+                    }
+                    catch (ArgumentException e)
+                    {
+                        return new ErrorResponse($"Invalid 'regex' '{filterRegex}': {e.Message}");
+                    }
+                    catch (RegexMatchTimeoutException)
+                    {
+                        return new ErrorResponse(
+                            $"Invalid 'regex' '{filterRegex}': compiling it exceeded the match timeout."
+                        );
+                    }
+
+                    DateTime? sinceUtc = null;
                     if (!string.IsNullOrEmpty(sinceTimestampStr))
                     {
-                        McpLog.Warn(
-                            "[ReadConsole] Filtering by 'since_timestamp' is not currently implemented."
+                        if (!TryParseTimestamp(sinceTimestampStr, out DateTime parsed))
+                        {
+                            return new ErrorResponse(
+                                $"Invalid 'since_timestamp' '{sinceTimestampStr}'. Use UTC ISO-8601 (2026-10-28T01:40:00Z), ISO without offset (read as UTC), or unix seconds/milliseconds."
+                            );
+                        }
+                        sinceUtc = parsed;
+                    }
+
+                    if (sinceUtc.HasValue)
+                    {
+                        return GetBufferedEntries(
+                            sinceUtc.Value,
+                            types,
+                            count,
+                            pageSize,
+                            cursor,
+                            textFilter,
+                            format,
+                            includeStacktrace,
+                            maxMessageChars
                         );
-                        // Need a way to get timestamp per log entry.
                     }
 
                     return GetConsoleEntries(
@@ -214,7 +253,7 @@ namespace MCPForUnity.Editor.Tools
                         count,
                         pageSize,
                         cursor,
-                        filterText,
+                        textFilter,
                         format,
                         includeStacktrace,
                         maxEntriesToScan,
@@ -258,7 +297,7 @@ namespace MCPForUnity.Editor.Tools
         /// <param name="count">Maximum entries to return in non-paging mode. Ignored when paging is active.</param>
         /// <param name="pageSize">Number of entries per page. Defaults to 50 when omitted.</param>
         /// <param name="cursor">Starting index for paging (0-based). Defaults to 0.</param>
-        /// <param name="filterText">Optional text filter (case-insensitive substring match).</param>
+        /// <param name="filter">Optional text/regex filter (both must match when supplied).</param>
         /// <param name="format">Output format: "plain", "detailed", or "json".</param>
         /// <param name="includeStacktrace">Whether to include stack traces in the output.</param>
         /// <returns>A success response with entries, or an error response.</returns>
@@ -267,7 +306,7 @@ namespace MCPForUnity.Editor.Tools
             int? count,
             int? pageSize,
             int? cursor,
-            string filterText,
+            TextFilter filter,
             string format,
             bool includeStacktrace,
             int maxEntriesToScan,
@@ -277,6 +316,7 @@ namespace MCPForUnity.Editor.Tools
             List<object> formattedEntries = new List<object>();
             int retrievedCount = 0;
             int totalMatches = 0;
+            bool sawInfoEntry = false;
             bool usePaging = pageSize.HasValue || cursor.HasValue;
             bool useTailScan = !usePaging && count.HasValue && count.Value > 0;
             // pageSize defaults to 50 when omitted; count is the overall non-paging limit only
@@ -361,16 +401,15 @@ namespace MCPForUnity.Editor.Tools
 
                     if (!want) continue;
 
-                    // Filter by text (case-insensitive)
-                    if (
-                        !string.IsNullOrEmpty(filterText)
-                        && message.IndexOf(filterText, StringComparison.OrdinalIgnoreCase) < 0
-                    )
+                    if (unityType == LogType.Log) sawInfoEntry = true;
+
+                    // Filter by text (case-insensitive) and optional regex
+                    if (!filter.Matches(message))
                     {
                         continue;
                     }
 
-                    // TODO: Filter by timestamp (requires timestamp data)
+                    // (Timestamp filtering is served from ConsoleLogBuffer; LogEntry has no timestamp.)
 
                     object formattedEntry = FormatEntry(
                         unityType,
@@ -436,6 +475,46 @@ namespace MCPForUnity.Editor.Tools
                 }
             }
 
+            int supplementedFromBuffer = 0;
+            if (
+                types.Contains("log")
+                && !sawInfoEntry
+                && ConsoleLogBuffer.Count > 0
+            )
+            {
+                // Unity's LogEntries view follows the Console window's severity toggles, so an
+                // editor with "Info" switched off reports no Log entries at all. The timestamped
+                // mirror is filter-independent and carries the authoritative LogType.
+                int budget = usePaging
+                    ? resolvedPageSize
+                    : Math.Max(0, (count ?? DefaultTailScanEntries) - retrievedCount);
+                foreach (
+                    ConsoleLogBuffer.Entry entry in ConsoleLogBuffer.CollectSince(DateTime.MinValue)
+                )
+                {
+                    if (supplementedFromBuffer >= budget) break;
+                    if (entry.type != LogType.Log) continue;
+                    string candidateMessage = string.IsNullOrEmpty(entry.stackTrace)
+                        ? entry.condition
+                        : $"{entry.condition}\n{entry.stackTrace}";
+                    if (!filter.Matches(candidateMessage))
+                    {
+                        continue;
+                    }
+                    formattedEntries.Add(FormatEntry(
+                        entry.type, candidateMessage, null, 0, format, includeStacktrace, maxMessageChars));
+                    supplementedFromBuffer++;
+                    totalMatches++;
+                }
+            }
+
+            if (filter.TimedOut)
+            {
+                return new ErrorResponse(
+                    "'regex' matching timed out after the fixed 1s per-match guard; the pattern is probably catastrophic backtracking. Narrow the pattern."
+                );
+            }
+
             if (usePaging)
             {
                 bool truncated = totalMatches > pageEndExclusive;
@@ -448,6 +527,9 @@ namespace MCPForUnity.Editor.Tools
                     truncated = truncated,
                     total = totalMatches,
                     items = formattedEntries,
+                    supplemented_from_console_mirror = supplementedFromBuffer == 0
+                        ? (int?)null
+                        : supplementedFromBuffer,
                 };
 
                 return new SuccessResponse(
@@ -458,12 +540,203 @@ namespace MCPForUnity.Editor.Tools
 
             // Return the filtered and formatted list (might be empty)
             return new SuccessResponse(
-                $"Retrieved {formattedEntries.Count} log entries.",
+                supplementedFromBuffer > 0
+                    ? $"Retrieved {formattedEntries.Count} log entries ({supplementedFromBuffer} came from the timestamped console mirror because Unity's console filter hid them)."
+                    : $"Retrieved {formattedEntries.Count} log entries.",
                 formattedEntries
             );
         }
 
         // --- Internal Helpers ---
+
+        /// <summary>
+        /// Combines the legacy substring filter with the optional regex filter. Both must match.
+        /// Patterns are capped in length and bounded by a per-match timeout so a pathological
+        /// expression cannot freeze the editor thread.
+        /// </summary>
+        private sealed class TextFilter
+        {
+            private const int MaxPatternChars = 200;
+            private static readonly TimeSpan MatchTimeout = TimeSpan.FromSeconds(1);
+
+            private readonly string _text;
+            private readonly Regex _regex;
+
+            internal bool TimedOut { get; private set; }
+
+            internal TextFilter(string text, string pattern)
+            {
+                _text = text;
+                if (string.IsNullOrEmpty(pattern)) return;
+                if (pattern.Length > MaxPatternChars)
+                {
+                    throw new ArgumentException(
+                        $"must be at most {MaxPatternChars} characters (got {pattern.Length})."
+                    );
+                }
+                _regex = new Regex(
+                    pattern,
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                    MatchTimeout
+                );
+            }
+
+            internal bool Matches(string message)
+            {
+                if (string.IsNullOrEmpty(message)) return false;
+                if (
+                    !string.IsNullOrEmpty(_text)
+                    && message.IndexOf(_text, StringComparison.OrdinalIgnoreCase) < 0
+                )
+                {
+                    return false;
+                }
+                if (_regex == null) return true;
+                try
+                {
+                    return _regex.IsMatch(message);
+                }
+                catch (RegexMatchTimeoutException)
+                {
+                    TimedOut = true;
+                    return false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Accepts ISO-8601 (offsets honoured, naive values read as UTC) or unix seconds/milliseconds.
+        /// </summary>
+        private static bool TryParseTimestamp(string raw, out DateTime utc)
+        {
+            utc = default;
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+            raw = raw.Trim();
+
+            if (long.TryParse(raw, out long numeric))
+            {
+                // Values above ~2.5e10 can only be milliseconds at realistic dates.
+                if (numeric > 25000000000L)
+                {
+                    if (numeric > DateTime.MaxValue.Ticks / TimeSpan.TicksPerMillisecond) return false;
+                    utc = new DateTime(numeric * TimeSpan.TicksPerMillisecond, DateTimeKind.Utc);
+                    return true;
+                }
+                if (numeric > DateTime.MaxValue.Ticks / TimeSpan.TicksPerSecond) return false;
+                utc = new DateTime(numeric * TimeSpan.TicksPerSecond, DateTimeKind.Utc);
+                return true;
+            }
+
+            if (DateTimeOffset.TryParse(
+                    raw,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal
+                        | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                    out DateTimeOffset offset))
+            {
+                utc = offset.UtcDateTime;
+                return true;
+            }
+            if (DateTime.TryParse(
+                    raw,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal
+                        | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                    out DateTime parsed))
+            {
+                utc = DateTime.SpecifyKind(parsed, DateTimeKind.Utc);
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Serves time-filtered entries from <see cref="ConsoleLogBuffer"/> because Unity's
+        /// LogEntry struct has no timestamp. Types come from the log callback itself, so no
+        /// message-content guessing is involved on this path.
+        /// </summary>
+        private static object GetBufferedEntries(
+            DateTime sinceUtc,
+            List<string> types,
+            int? count,
+            int? pageSize,
+            int? cursor,
+            TextFilter filter,
+            string format,
+            bool includeStacktrace,
+            int maxMessageChars
+        )
+        {
+            List<ConsoleLogBuffer.Entry> buffered = ConsoleLogBuffer.CollectSince(sinceUtc);
+            bool usePaging = pageSize.HasValue && pageSize.Value > 0;
+            int resolvedPageSize = usePaging ? Math.Clamp(pageSize.Value, 1, 500) : 0;
+            int resolvedCursor = usePaging ? Math.Max(0, cursor ?? 0) : 0;
+            int limit = usePaging
+                ? resolvedCursor + resolvedPageSize + 1
+                : Math.Min(count ?? DefaultTailScanEntries, DefaultTailScanEntries);
+
+            var items = new List<object>();
+            int totalMatches = 0;
+            foreach (ConsoleLogBuffer.Entry entry in buffered)
+            {
+                string token = entry.type.ToString().ToLowerInvariant();
+                bool want;
+                if (entry.type == LogType.Exception)
+                    want = types.Contains("error") || types.Contains("exception");
+                else if (entry.type == LogType.Assert)
+                    want = types.Contains("error") || types.Contains("assert");
+                else
+                    want = types.Contains(token);
+                if (!want) continue;
+
+                string message = string.IsNullOrEmpty(entry.stackTrace)
+                    ? entry.condition
+                    : $"{entry.condition}\n{entry.stackTrace}";
+                if (!filter.Matches(message)) continue;
+
+                totalMatches++;
+                if (totalMatches > limit) break;
+                if (usePaging && totalMatches <= resolvedCursor) continue;
+
+                items.Add(FormatEntry(
+                    entry.type, message, null, 0, format, includeStacktrace, maxMessageChars));
+            }
+
+            if (filter.TimedOut)
+            {
+                return new ErrorResponse(
+                    "'regex' matching timed out after the fixed 1s per-match guard; the pattern is probably catastrophic backtracking. Narrow the pattern."
+                );
+            }
+
+            DateTime? coverageStart = ConsoleLogBuffer.CoverageStartUtc;
+            var payload = new
+            {
+                items,
+                cursor = usePaging ? resolvedCursor : (int?)null,
+                pageSize = usePaging ? (int?)resolvedPageSize : null,
+                nextCursor = usePaging && totalMatches > resolvedCursor + resolvedPageSize
+                    ? (resolvedCursor + resolvedPageSize).ToString()
+                    : null,
+                truncated = usePaging
+                    ? totalMatches > resolvedCursor + resolvedPageSize
+                    : totalMatches >= limit,
+                total = totalMatches,
+                source = "console_log_buffer",
+                since_utc = sinceUtc.ToString("O"),
+                coverage_start_utc = coverageStart?.ToString("O"),
+                possibly_incomplete = ConsoleLogBuffer.IsFull
+                    && coverageStart.HasValue
+                    && coverageStart.Value > sinceUtc,
+                warning = ConsoleLogBuffer.Count == 0
+                    ? "No entries recorded yet: the timestamped console mirror only sees logs emitted after the editor loaded the MCP package. Restart-independent history is unavailable."
+                    : null,
+            };
+            return new SuccessResponse(
+                $"Retrieved {items.Count} log entries (since {sinceUtc:O}).",
+                payload
+            );
+        }
 
         private static object FormatEntry(
             LogType unityType,
@@ -566,15 +839,33 @@ namespace MCPForUnity.Editor.Tools
                 || fullMessage.IndexOf(": error CS", StringComparison.OrdinalIgnoreCase) >= 0)
                 return LogType.Error;
 
+            // Loose keywords must be matched on the message body only. Stack traces routinely
+            // contain "Exception" (e.g. ExceptionDispatchInfo.Throw), which used to reclassify
+            // plain Debug.Log entries as exceptions and hide them from types=["log"].
+            string body = GetMessageBody(fullMessage);
+
             // Exceptions (avoid misclassifying compiler diagnostics)
-            if (fullMessage.IndexOf("Exception", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (body.IndexOf("Exception", StringComparison.OrdinalIgnoreCase) >= 0)
                 return LogType.Exception;
 
             // Unity assertions
-            if (fullMessage.IndexOf("Assertion", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (body.IndexOf("Assertion", StringComparison.OrdinalIgnoreCase) >= 0)
                 return LogType.Assert;
 
             return LogType.Log;
+        }
+
+        /// <summary>
+        /// Returns the message without its appended stack trace, so that keyword-based
+        /// severity guessing is not driven by frames that merely mention Exception/Assert.
+        /// </summary>
+        private static string GetMessageBody(string fullMessage)
+        {
+            if (string.IsNullOrEmpty(fullMessage)) return fullMessage;
+            string stack = ExtractStackTrace(fullMessage);
+            if (string.IsNullOrEmpty(stack)) return fullMessage;
+            int index = fullMessage.IndexOf(stack, StringComparison.Ordinal);
+            return index > 0 ? fullMessage.Substring(0, index) : fullMessage;
         }
 
         private static bool IsExplicitDebugLog(string fullMessage)

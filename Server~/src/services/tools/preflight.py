@@ -64,10 +64,18 @@ async def preflight(
     if not isinstance(data, dict):
         return None
 
+    play_mode = data.get("play_mode")
+    is_playing = isinstance(play_mode, dict) and play_mode.get("is_playing") is True
+
     # Optional refresh-if-dirty
     if refresh_if_dirty:
         assets = data.get("assets")
-        if isinstance(assets, dict) and assets.get("external_changes_dirty") is True:
+        if is_playing:
+            # Unity defers script compilation until Play mode exits. Refreshing here would
+            # enter refresh_unity(wait_for_ready=True), which cannot finish while Play runs,
+            # and the caller would block until the MCP client gives up on the request.
+            pass
+        elif isinstance(assets, dict) and assets.get("external_changes_dirty") is True:
             try:
                 from services.tools.refresh_unity import refresh_unity
                 await refresh_unity(
@@ -97,6 +105,10 @@ async def preflight(
         is_domain_reload_pending = isinstance(compilation, dict) and compilation.get(
             "is_domain_reload_pending") is True
         if is_compiling or is_domain_reload_pending:
+            # A pending compile during Play only runs after Play exits, so a short retry
+            # would just burn calls; report the different reason and back off.
+            if is_playing:
+                return _busy("compile_deferred_until_play_exit", 5000)
             return _busy("compiling", 500)
 
     # Staleness: if the snapshot is stale, proceed (tools will still run), but callers that read resources can back off.

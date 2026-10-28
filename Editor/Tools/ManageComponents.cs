@@ -34,8 +34,11 @@ namespace MCPForUnity.Editor.Tools
             string action = ParamCoercion.CoerceString(@params["action"], null)?.ToLowerInvariant();
             if (string.IsNullOrEmpty(action))
             {
-                return new ErrorResponse("'action' parameter is required (add, remove, set_property).");
+                return new ErrorResponse("'action' parameter is required (add, remove, set_property, save_camera_preset).");
             }
+
+            if (action == "save_camera_preset")
+                return MCPForUnity.Editor.Services.CameraShotPresetCommands.Save(@params);
 
             // Target resolution
             JToken targetToken = @params["target"];

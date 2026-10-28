@@ -87,7 +87,7 @@ def _classified_tool_result(exc: PluginDisconnectedError) -> Any:
     from mcp.types import TextContent
     from fastmcp.tools.tool import ToolResult
 
-    payload = _classified_error_payload(exc)
+    payload = getattr(exc, "payload", None) or _classified_error_payload(exc)
     return ToolResult(
         content=[TextContent(
             type="text",
@@ -335,7 +335,7 @@ class UnityInstanceMiddleware(Middleware):
     # Tools that manage the instance selection itself must stay callable even
     # when the stored selection is unreachable — they are the escape hatch out
     # of a dead selection (e.g. the selected project was closed for good).
-    _SELECTION_MANAGEMENT_TOOLS = frozenset({"set_active_instance"})
+    _SELECTION_MANAGEMENT_TOOLS = frozenset({"set_active_instance", "claim_instance", "health"})
 
     # Same escape hatch on the resource side: `mcpforunity://instances` is the
     # enumeration entry point that set_active_instance's own error messages
@@ -626,14 +626,37 @@ class UnityInstanceMiddleware(Middleware):
         shape send_command-path errors use — instead of a protocol-level error
         that only forwards the message text.
         """
+        from services.state.instance_locks import (
+            InstanceBusyError, get_instance_write_locks, is_mutating_tool, resolve_lock_instance,
+        )
+
         try:
             await self._inject_unity_instance(context)
-            return await call_next(context)
+            message = context.message
+            arguments = getattr(message, "arguments", None) or {}
+            if not is_mutating_tool(message.name, arguments):
+                return await call_next(context)
+            owner_key = self.get_session_key(context.fastmcp_context)
+            if not owner_key:
+                return _classified_tool_result(InstanceBusyError({
+                    "success": False, "code": "mcp_session_identity_required",
+                    "category": "session", "retryable": False,
+                    "error": "A stable MCP client session is required for Unity write coordination.",
+                }))
+            ctx = context.fastmcp_context
+            get_state = getattr(ctx, "get_state", None)
+            selected = get_state("unity_instance") if callable(get_state) else None
+            instance = arguments.get("unity_instance") or selected
+            project_hash, label = await resolve_lock_instance(instance)
+            async with get_instance_write_locks().hold(project_hash, label, owner_key):
+                return await call_next(context)
         except PluginDisconnectedError as exc:
             logger.info(
                 "Failing tool call as retryable classified result: %s",
                 exc.code or "unity_instance_unreachable",
             )
+            return _classified_tool_result(exc)
+        except InstanceBusyError as exc:
             return _classified_tool_result(exc)
 
     async def on_read_resource(self, context: MiddlewareContext, call_next):

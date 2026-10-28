@@ -476,7 +476,7 @@ namespace MCPForUnity.Editor.Windows.Components.Tools
             };
             screenshotButton.AddToClassList("tool-action-button");
             screenshotButton.style.marginTop = 4;
-            screenshotButton.tooltip = "通过 manage_scene 将当前编辑器画面截图保存到 Assets/Screenshots。";
+            screenshotButton.tooltip = "通过 manage_scene 将当前相机画面同步保存到 Library/MCPScreenshots。";
             screenshotButton.SetEnabled(MCPServiceLocator.ToolDiscovery.IsToolEnabled(tool.Name));
             toolToggle?.RegisterValueChangedCallback(evt => screenshotButton.SetEnabled(evt.newValue));
 

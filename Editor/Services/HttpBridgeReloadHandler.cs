@@ -71,6 +71,7 @@ namespace MCPForUnity.Editor.Services
 
                 if (shouldResume)
                 {
+                    RuntimeSamplingService.CompleteForDomainReload();
                     // 域重载前取消所有 pending 命令（对齐 StdioBridgeHost.Stop 的模式），
                     // 避免旧命令在新域中继续执行或悬挂到超时
                     try { TransportCommandDispatcher.CancelAllPending("domain_reload"); } catch { }

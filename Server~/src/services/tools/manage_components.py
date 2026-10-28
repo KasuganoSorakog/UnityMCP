@@ -14,22 +14,30 @@ from services.tools.preflight import preflight
 
 
 @mcp_for_unity_tool(
-    description="Manages components on GameObjects (add, remove, set_property). For reading component data, use the mcpforunity://scene/gameobject/{id}/components resource. Scene object references use {\"instanceID\": 12345}; reacquire IDs after a domain reload."
+    description="Manages components (add, remove, set_property) and saves named camera presets with save_camera_preset. For reading component data, use the mcpforunity://scene/gameobject/{id}/components resource. Scene object references use {\"instanceID\": 12345}; reacquire IDs after a domain reload."
 )
 async def manage_components(
     ctx: Context,
     action: Annotated[
-        Literal["add", "remove", "set_property"],
-        "Action to perform: add (add component), remove (remove component), set_property (set component property)"
+        Literal["add", "remove", "set_property", "save_camera_preset"],
+        "Action to perform: add, remove, set_property, or save_camera_preset"
     ],
     target: Annotated[
         str | int,
         "Target GameObject - instance ID (preferred) or name/path"
-    ],
+    ] | None = None,
     component_type: Annotated[
         str,
         "Component type name (e.g., 'Rigidbody', 'BoxCollider', 'MyScript')"
-    ],
+    ] | None = None,
+    preset_name: Annotated[
+        str,
+        "Unique name for save_camera_preset; names are never silently replaced"
+    ] | None = None,
+    follow_target: Annotated[
+        str,
+        "Optional GameObject path or ID whose position and rotation the preset follows"
+    ] | None = None,
     search_method: Annotated[
         Literal["by_id", "by_name", "by_path"],
         "How to find the target GameObject"
@@ -54,6 +62,7 @@ async def manage_components(
     - add: Add a new component to a GameObject
     - remove: Remove a component from a GameObject  
     - set_property: Set one or more properties on a component
+    - save_camera_preset: Save the current Scene view under a unique preset_name, optionally following a target
 
     Examples:
     - Add Rigidbody: action="add", target="Player", component_type="Rigidbody"
@@ -74,8 +83,21 @@ async def manage_components(
     if not action:
         return {
             "success": False,
-            "message": "Missing required parameter 'action'. Valid actions: add, remove, set_property"
+            "message": "Missing required parameter 'action'. Valid actions: add, remove, set_property, save_camera_preset"
         }
+
+    if action == "save_camera_preset":
+        if not isinstance(preset_name, str) or not preset_name.strip():
+            return {"success": False, "message": "preset_name is required for save_camera_preset."}
+        try:
+            response = await send_with_unity_instance(
+                async_send_command_with_retry, unity_instance, "manage_components", {
+                    "action": action, "presetName": preset_name.strip(), "followTarget": follow_target,
+                },
+            )
+            return response if isinstance(response, dict) else {"success": False, "message": str(response)}
+        except Exception as exc:
+            return {"success": False, "message": f"Error saving camera preset: {exc!s}"}
 
     if not target:
         return {

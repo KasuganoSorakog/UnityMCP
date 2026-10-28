@@ -50,12 +50,12 @@ def _is_ready(data: dict[str, Any] | None) -> bool:
     return isinstance(advice, dict) and advice.get("ready_for_tools") is True
 
 
-def _is_session_disconnect(response: Any) -> bool:
+def _is_recoverable_compile_interruption(response: Any) -> bool:
     payload = _as_payload(response)
     data = payload.get("data")
     reason = data.get("reason") if isinstance(data, dict) else None
     code = payload.get("code")
-    return code == "unity_session_disconnected" or reason == "unity_session_disconnected"
+    return code in {"unity_session_disconnected", "unity_execution_state_unknown"} or reason == "unity_session_disconnected"
 
 
 async def _read_editor_state(ctx: Context, unity_instance: str | None) -> dict[str, Any] | None:
@@ -93,11 +93,7 @@ async def _wait_for_refresh_completion(
                 and current_reload_after_ms != baseline_reload_after_ms
             )
 
-            evidence_satisfied = (
-                not require_reload_evidence
-                or reload_observed
-                or busy_observed
-            )
+            evidence_satisfied = not require_reload_evidence or reload_observed
             if _is_ready(data) and evidence_satisfied:
                 return {
                     "completed": True,
@@ -186,7 +182,7 @@ async def refresh_unity(
     response_succeeded = response_payload.get("success", True)
 
     if not response_succeeded:
-        if not (compile_requested and _is_session_disconnect(response)):
+        if not (compile_requested and _is_recoverable_compile_interruption(response)):
             return MCPResponse(**response_payload) if response_payload else response
 
         # RequestScriptCompilation 会销毁承载本次 command_result 的旧 WebSocket。
@@ -214,6 +210,7 @@ async def refresh_unity(
                 "recovered_after_session_disconnect": True,
                 "safe_to_retry_refresh": False,
             },
+            hint="Unity refresh completed; editor is ready.",
         )
 
     elif wait_for_ready:
@@ -228,6 +225,22 @@ async def refresh_unity(
                 compile_requested=compile_requested,
                 recovery=recovery,
             )
+        data = response_payload.get("data")
+        merged = dict(data) if isinstance(data, dict) else {}
+        # The Unity-side hint describes the pre-reload state; keep only the final ready hint.
+        merged.pop("hint", None)
+        response = MCPResponse(
+            success=True,
+            message="Unity refresh completed after the editor session reconnected." if compile_requested else "Unity refresh completed.",
+            data={
+                **merged,
+                "resulting_state": "idle",
+                "domain_reload_observed": recovery["domain_reload_observed"],
+                "recovered_after_session_disconnect": recovery["domain_reload_observed"],
+                "safe_to_retry_refresh": False,
+            },
+            hint="Unity refresh completed; editor is ready.",
+        )
 
     # After readiness is restored, clear any external-dirty flag for this instance so future tools can proceed cleanly.
     try:

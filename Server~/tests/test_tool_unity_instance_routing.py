@@ -15,6 +15,8 @@ for module_name in (
     sys.modules.pop(module_name, None)
 importlib.invalidate_caches()
 
+from services.tools.capture_view import capture_view
+from services.tools.sample_runtime import sample_runtime
 from services.tools.execute_menu_item import execute_menu_item
 from services.tools.find_gameobjects import find_gameobjects
 from services.tools.find_in_file import find_in_file
@@ -41,6 +43,8 @@ from services.tools.script_apply_edits import script_apply_edits
 
 
 ROUTED_TOOLS = [
+    capture_view,
+    sample_runtime,
     execute_custom_tool,
     execute_menu_item,
     find_gameobjects,

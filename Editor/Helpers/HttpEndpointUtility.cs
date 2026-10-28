@@ -16,6 +16,17 @@ namespace MCPForUnity.Editor.Helpers
     {
         private const string PrefKey = EditorPrefKeys.HttpBaseUrl;
         private const string DefaultBaseUrl = "http://localhost:8080";
+        private static string testRpcUrlOverride;
+
+        public static void OverrideHttpRpcUrlForTesting(string rpcUrl)
+        {
+            testRpcUrlOverride = string.IsNullOrWhiteSpace(rpcUrl) ? null : rpcUrl.Trim();
+        }
+
+        public static void ResetHttpRpcUrlOverrideForTesting()
+        {
+            testRpcUrlOverride = null;
+        }
 
         /// <summary>
         /// Returns the normalized base URL currently stored for this project.
@@ -41,7 +52,7 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static string GetMcpRpcUrl()
         {
-            return AppendPathSegment(GetBaseUrl(), "mcp");
+            return testRpcUrlOverride ?? AppendPathSegment(GetBaseUrl(), "mcp");
         }
 
         /// <summary>

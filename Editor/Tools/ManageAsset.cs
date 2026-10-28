@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -624,9 +625,39 @@ namespace MCPForUnity.Editor.Tools
             }
         }
 
+        /// <summary>
+        /// Compiles an optional asset-path regex with a length cap and a per-match timeout so a
+        /// pathological pattern cannot stall the editor thread. Returns null when unused.
+        /// </summary>
+        private static Regex CompileSearchRegex(string pattern)
+        {
+            if (string.IsNullOrEmpty(pattern)) return null;
+            if (pattern.Length > 200)
+            {
+                throw new ArgumentException(
+                    $"must be at most 200 characters (got {pattern.Length})."
+                );
+            }
+            return new Regex(
+                pattern,
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                TimeSpan.FromSeconds(1)
+            );
+        }
+
         private static object SearchAssets(JObject @params)
         {
             string searchPattern = @params["searchPattern"]?.ToString();
+            string filterRegex = @params["regex"]?.ToString() ?? @params["searchRegex"]?.ToString();
+            Regex assetRegex;
+            try
+            {
+                assetRegex = CompileSearchRegex(filterRegex);
+            }
+            catch (ArgumentException e)
+            {
+                return new ErrorResponse($"Invalid 'regex' '{filterRegex}': {e.Message}");
+            }
             string filterType = @params["filterType"]?.ToString();
             string pathScope = @params["path"]?.ToString(); // Use path as folder scope
             string filterDateAfterStr = @params["filterDateAfter"]?.ToString();
@@ -701,6 +732,21 @@ namespace MCPForUnity.Editor.Tools
                         if (lastWriteTime <= filterDateAfter.Value)
                         {
                             continue; // Skip assets older than or equal to the filter date
+                        }
+                    }
+
+                    // Apply regex filter on the asset path before counting or paging
+                    if (assetRegex != null)
+                    {
+                        try
+                        {
+                            if (!assetRegex.IsMatch(assetPath)) continue;
+                        }
+                        catch (RegexMatchTimeoutException)
+                        {
+                            return new ErrorResponse(
+                                "'regex' matching timed out after the fixed 1s per-match guard; narrow the pattern."
+                            );
                         }
                     }
 

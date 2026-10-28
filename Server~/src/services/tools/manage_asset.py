@@ -3,6 +3,7 @@ Defines the manage_asset tool for interacting with Unity assets.
 """
 import asyncio
 import json
+import re
 from typing import Annotated, Any, Literal
 
 from fastmcp import Context
@@ -44,6 +45,8 @@ async def manage_asset(
                               "Search pattern (e.g., '*.prefab' or AssetDatabase filters like 't:MonoScript'). "
                               "Recommended: put queries like 't:MonoScript' here and set path='Assets'."] | None = None,
     filter_type: Annotated[str, "Filter type for search"] | None = None,
+    regex: Annotated[str,
+                     "search only: case-insensitive regex applied to each asset path after Unity's own filters and before pagination. Max 200 characters; each match is bounded by a 1s timeout in the editor."] | None = None,
     filter_date_after: Annotated[str,
                                  "Date after which to filter"] | None = None,
     page_size: Annotated[int | float | str,
@@ -94,6 +97,18 @@ async def manage_asset(
             filter_type = asset_type
             await ctx.info("manage_asset(search): mapped `asset_type` into `filter_type` for safer server-side filtering")
 
+    if isinstance(regex, str):
+        regex = regex.strip() or None
+    if regex is not None:
+        if action.lower() != "search":
+            return {"success": False, "message": "regex is only supported for action='search'."}
+        if len(regex) > 200:
+            return {"success": False, "message": f"regex must be at most 200 characters (got {len(regex)})."}
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            return {"success": False, "message": f"Invalid regex: {exc}"}
+
     # Prepare parameters for the C# handler
     params_dict = {
         "action": action.lower(),
@@ -104,6 +119,7 @@ async def manage_asset(
         "generatePreview": generate_preview,
         "searchPattern": search_pattern,
         "filterType": filter_type,
+        "regex": regex,
         "filterDateAfter": filter_date_after,
         "pageSize": page_size,
         "pageNumber": page_number

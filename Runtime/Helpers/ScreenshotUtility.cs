@@ -9,146 +9,77 @@ namespace MCPForUnity.Runtime.Helpers
 {
     public readonly struct ScreenshotCaptureResult
     {
-        public ScreenshotCaptureResult(string fullPath, string assetsRelativePath, int superSize)
+        public ScreenshotCaptureResult(string fullPath, string projectRelativePath, int superSize)
         {
             FullPath = fullPath;
-            AssetsRelativePath = assetsRelativePath;
+            ProjectRelativePath = projectRelativePath;
             SuperSize = superSize;
         }
 
         public string FullPath { get; }
-        public string AssetsRelativePath { get; }
+        public string ProjectRelativePath { get; }
+        public string AssetsRelativePath => ProjectRelativePath;
         public int SuperSize { get; }
     }
 
     public static class ScreenshotUtility
     {
-        private const string ScreenshotsFolderName = "Screenshots";
-
         public static ScreenshotCaptureResult CaptureToAssetsFolder(string fileName = null, int superSize = 1, bool ensureUniqueFileName = true)
         {
-            int size = Mathf.Max(1, superSize);
-            string resolvedName = BuildFileName(fileName);
-            string folder = Path.Combine(Application.dataPath, ScreenshotsFolderName);
-            Directory.CreateDirectory(folder);
-
-            string fullPath = Path.Combine(folder, resolvedName);
-            if (ensureUniqueFileName)
-            {
-                fullPath = EnsureUnique(fullPath);
-            }
-
-            string normalizedFullPath = fullPath.Replace('\\', '/');
-
-            // Use only the file name to let Unity decide the final location (per CaptureScreenshot docs).
-            string captureName = Path.GetFileName(normalizedFullPath);
-
-            // Use Asset folder for ScreenCapture.CaptureScreenshot to ensure write to asset rather than project root
-            string projectRoot = GetProjectRootPath();
-            string assetsRelativePath = normalizedFullPath;
-            if (assetsRelativePath.StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase))
-            {
-                assetsRelativePath = assetsRelativePath.Substring(projectRoot.Length).TrimStart('/');
-            }
-
-#if UNITY_2022_1_OR_NEWER
-            if (!TryCaptureScreenshot(assetsRelativePath, size))
-            {
-                Debug.LogWarning("ScreenCaptureModule is unavailable. Using main camera capture as fallback.");
-                CaptureFromCameraToAssetsFolder(Camera.main, captureName, size, false);
-            }
-#else
-            Debug.LogWarning("ScreenCapture is supported after Unity 2022.1. Using main camera capture as fallback.");
-            CaptureFromCameraToAssetsFolder(Camera.main, captureName, size, false);
-#endif      
-
-            return new ScreenshotCaptureResult(
-                normalizedFullPath,
-                assetsRelativePath,
-                size);
+            return CaptureFromCamera(Camera.main, fileName, superSize, ensureUniqueFileName);
         }
 
-        /// <summary>
-        /// Captures a screenshot from a specific camera by rendering into a temporary RenderTexture (works in Edit Mode).
-        /// </summary>
         public static ScreenshotCaptureResult CaptureFromCameraToAssetsFolder(Camera camera, string fileName = null, int superSize = 1, bool ensureUniqueFileName = true)
+        {
+            return CaptureFromCamera(camera, fileName, superSize, ensureUniqueFileName);
+        }
+
+        public static ScreenshotCaptureResult CaptureFromCamera(Camera camera, string fileName = null, int superSize = 1, bool ensureUniqueFileName = true)
         {
             if (camera == null)
             {
-                throw new ArgumentNullException(nameof(camera));
+                throw new InvalidOperationException("No camera is available. Use capture_view with a target or an explicit camera preset.");
             }
 
             int size = Mathf.Max(1, superSize);
-            string resolvedName = BuildFileName(fileName);
-            string folder = Path.Combine(Application.dataPath, ScreenshotsFolderName);
-            Directory.CreateDirectory(folder);
-
-            string fullPath = Path.Combine(folder, resolvedName);
+            string fullPath = Path.Combine(
+                GetProjectRootPath(), "Library", "MCPScreenshots", BuildFileName(fileName));
             if (ensureUniqueFileName)
             {
                 fullPath = EnsureUnique(fullPath);
             }
+            string normalizedFullPath = Path.GetFullPath(fullPath).Replace('\\', '/');
+            Directory.CreateDirectory(Path.GetDirectoryName(normalizedFullPath));
 
-            string normalizedFullPath = fullPath.Replace('\\', '/');
-
-            int width = Mathf.Max(1, camera.pixelWidth > 0 ? camera.pixelWidth : Screen.width);
-            int height = Mathf.Max(1, camera.pixelHeight > 0 ? camera.pixelHeight : Screen.height);
-            width *= size;
-            height *= size;
-
-            RenderTexture prevRT = camera.targetTexture;
-            RenderTexture prevActive = RenderTexture.active;
-            var rt = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32);
-            Texture2D tex = null;
+            int width = Mathf.Max(1, camera.pixelWidth > 0 ? camera.pixelWidth : Screen.width) * size;
+            int height = Mathf.Max(1, camera.pixelHeight > 0 ? camera.pixelHeight : Screen.height) * size;
+            RenderTexture previousTarget = camera.targetTexture;
+            RenderTexture previousActive = RenderTexture.active;
+            var renderTexture = RenderTexture.GetTemporary(width, height, 24, RenderTextureFormat.ARGB32);
+            Texture2D texture = null;
             try
             {
-                camera.targetTexture = rt;
+                camera.targetTexture = renderTexture;
                 camera.Render();
-
-                RenderTexture.active = rt;
-                tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
-                tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-                tex.Apply();
-
-                byte[] png = EncodeTextureToPng(tex);
-                File.WriteAllBytes(normalizedFullPath, png);
+                RenderTexture.active = renderTexture;
+                texture = new Texture2D(width, height, TextureFormat.RGBA32, false);
+                texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                texture.Apply();
+                File.WriteAllBytes(normalizedFullPath, EncodeTextureToPng(texture));
             }
             finally
             {
-                camera.targetTexture = prevRT;
-                RenderTexture.active = prevActive;
-                RenderTexture.ReleaseTemporary(rt);
-                // Texture2D native pixel memory (tens of MB at 8k) is otherwise only freed by the GC finalizer
-                if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
+                camera.targetTexture = previousTarget;
+                RenderTexture.active = previousActive;
+                RenderTexture.ReleaseTemporary(renderTexture);
+                if (texture != null) UnityEngine.Object.DestroyImmediate(texture);
             }
 
             string projectRoot = GetProjectRootPath();
-            string assetsRelativePath = normalizedFullPath;
-            if (assetsRelativePath.StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase))
-            {
-                assetsRelativePath = assetsRelativePath.Substring(projectRoot.Length).TrimStart('/');
-            }
-
-            return new ScreenshotCaptureResult(normalizedFullPath, assetsRelativePath, size);
-        }
-
-        private static bool TryCaptureScreenshot(string path, int superSize)
-        {
-            Type screenCaptureType = Type.GetType("UnityEngine.ScreenCapture, UnityEngine.ScreenCaptureModule");
-            MethodInfo captureMethod = screenCaptureType?.GetMethod(
-                "CaptureScreenshot",
-                BindingFlags.Public | BindingFlags.Static,
-                null,
-                new[] { typeof(string), typeof(int) },
-                null);
-
-            if (captureMethod == null)
-            {
-                return false;
-            }
-
-            captureMethod.Invoke(null, new object[] { path, superSize });
-            return true;
+            string relativePath = normalizedFullPath.StartsWith(projectRoot, StringComparison.OrdinalIgnoreCase)
+                ? normalizedFullPath.Substring(projectRoot.Length)
+                : normalizedFullPath;
+            return new ScreenshotCaptureResult(normalizedFullPath, relativePath, size);
         }
 
         private static byte[] EncodeTextureToPng(Texture2D texture)

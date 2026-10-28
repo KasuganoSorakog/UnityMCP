@@ -19,6 +19,7 @@ namespace MCPForUnity.Editor.Services
         private static readonly object LockObj = new();
         private static long _sequence;
         private static long _observedUnixMs;
+        private static bool _playModeChanging;
 
         private static bool _lastIsCompiling;
         private static long? _lastCompileStartedUnixMs;
@@ -237,7 +238,7 @@ namespace MCPForUnity.Editor.Services
                 _cached = BuildSnapshot("init");
 
                 EditorApplication.update += OnUpdate;
-                EditorApplication.playModeStateChanged += _ => ForceUpdate("playmode");
+                EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
 
                 AssemblyReloadEvents.beforeAssemblyReload += () =>
                 {
@@ -256,6 +257,13 @@ namespace MCPForUnity.Editor.Services
             {
                 McpLog.Error($"[EditorStateCache] Failed to initialise: {ex.Message}\n{ex.StackTrace}");
             }
+        }
+
+        private static void OnPlayModeStateChanged(PlayModeStateChange change)
+        {
+            _playModeChanging = change == PlayModeStateChange.ExitingEditMode ||
+                                change == PlayModeStateChange.ExitingPlayMode;
+            ForceUpdate("playmode_" + change);
         }
 
         private static void OnUpdate()
@@ -326,7 +334,7 @@ namespace MCPForUnity.Editor.Services
             {
                 activityPhase = "asset_import";
             }
-            else if (EditorApplication.isPlayingOrWillChangePlaymode)
+            else if (_playModeChanging)
             {
                 activityPhase = "playmode_transition";
             }
@@ -351,7 +359,7 @@ namespace MCPForUnity.Editor.Services
                     {
                         IsPlaying = EditorApplication.isPlaying,
                         IsPaused = EditorApplication.isPaused,
-                        IsChanging = EditorApplication.isPlayingOrWillChangePlaymode
+                        IsChanging = _playModeChanging
                     },
                     ActiveScene = new EditorStateActiveScene
                     {

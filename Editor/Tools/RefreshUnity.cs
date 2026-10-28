@@ -90,7 +90,7 @@ namespace MCPForUnity.Editor.Tools
                 return new ErrorResponse($"refresh_failed: {ex.Message}");
             }
 
-            if (waitForReady)
+            if (waitForReady && !compileRequested)
             {
                 try
                 {
@@ -120,7 +120,7 @@ namespace MCPForUnity.Editor.Tools
                 refresh_triggered = refreshTriggered,
                 compile_requested = compileRequested,
                 resulting_state = resultingState,
-                hint = waitForReady
+                hint = waitForReady && !compileRequested
                     ? "Unity refresh completed; editor should be ready."
                     : "If Unity enters compilation/domain reload, poll editor_state until ready_for_tools is true."
             });

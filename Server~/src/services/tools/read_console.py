@@ -1,6 +1,7 @@
 """
 Defines the read_console tool for accessing Unity Editor console messages.
 """
+import re
 from typing import Annotated, Any, Literal
 
 from fastmcp import Context
@@ -35,8 +36,10 @@ async def read_console(
     count: Annotated[int | str,
                      "Max messages to return in non-paging mode (accepts int or string, e.g., 5 or '5'). Ignored when paging with page_size/cursor."] | None = None,
     filter_text: Annotated[str, "Text filter for messages"] | None = None,
+    regex: Annotated[str,
+                     "Optional case-insensitive regex applied to each message, combined with filter_text (both must match). Max 200 characters; each match is bounded by a 1s timeout in the editor, and an invalid or pathological pattern returns an error instead of a result."] | None = None,
     since_timestamp: Annotated[str,
-                               "Get messages after this timestamp (ISO 8601)"] | None = None,
+                               "Return messages logged at/after this UTC time: ISO-8601 (2026-10-28T01:40:00Z), ISO without offset (read as UTC), or unix seconds/milliseconds. Served from the editor's timestamped console mirror, so it only covers logs emitted after the MCP package loaded; the response reports coverage_start_utc and possibly_incomplete."] | None = None,
     page_size: Annotated[int | str,
                          "Page size for paginated console reads. Defaults to 50 when omitted."] | None = None,
     cursor: Annotated[int | str,
@@ -91,12 +94,26 @@ async def read_console(
     if action == "get" and count is None:
         count = 10
 
+    if isinstance(regex, str):
+        regex = regex.strip() or None
+    if regex is not None:
+        if len(regex) > 200:
+            return {
+                "success": False,
+                "message": f"regex must be at most 200 characters (got {len(regex)}).",
+            }
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            return {"success": False, "message": f"Invalid regex: {exc}"}
+
     # Prepare parameters for the C# handler
     params_dict = {
         "action": action,
         "types": types,
         "count": count,
         "filterText": filter_text,
+        "regex": regex,
         "sinceTimestamp": since_timestamp,
         "pageSize": coerced_page_size,
         "cursor": coerced_cursor,

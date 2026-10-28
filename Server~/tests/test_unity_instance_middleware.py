@@ -78,6 +78,10 @@ class PluginHub:
     async def _resolve_session_id(cls, unity_instance):
         raise RuntimeError("not connected")
 
+    @classmethod
+    async def _describe_instance(cls, session_id, unity_instance):
+        return "aaa111", unity_instance or session_id
+
 
 class PluginDisconnectedError(RuntimeError):
     """Mirror of transport.plugin_hub.PluginDisconnectedError (stubbed here to
@@ -256,6 +260,9 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
             def set_state(self, key, value):
                 self.state[key] = value
 
+            def get_state(self, key):
+                return self.state.get(key)
+
         class MiddlewareContext:
             def __init__(self, fastmcp_context):
                 self.fastmcp_context = fastmcp_context
@@ -298,6 +305,9 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
             def set_state(self, key, value):
                 self.state[key] = value
+
+            def get_state(self, key):
+                return self.state.get(key)
 
         class MiddlewareContext:
             def __init__(self, fastmcp_context, message=None):
@@ -344,6 +354,9 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
             def set_state(self, key, value):
                 self.state[key] = value
+
+            def get_state(self, key):
+                return self.state.get(key)
 
         class MiddlewareContext:
             def __init__(self, fastmcp_context, message=None):
@@ -397,6 +410,9 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
             def set_state(self, key, value):
                 self.state[key] = value
 
+            def get_state(self, key):
+                return self.state.get(key)
+
         class MiddlewareContext:
             def __init__(self, fastmcp_context, message=None):
                 self.fastmcp_context = fastmcp_context
@@ -441,6 +457,9 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
             def set_state(self, key, value):
                 self.state[key] = value
+
+            def get_state(self, key):
+                return self.state.get(key)
 
         class MiddlewareContext:
             def __init__(self, fastmcp_context):
@@ -488,6 +507,9 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
             def set_state(self, key, value):
                 self.state[key] = value
+
+            def get_state(self, key):
+                return self.state.get(key)
 
         return ContextState(
             client_id="client-a",
@@ -582,8 +604,7 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
         async def run_test():
             middleware = UnityInstanceMiddleware()
             middleware._is_http_transport = lambda: True
-            ctx = SimpleNamespace(
-                client_id="client-a", session_id=None, request_context=None)
+            ctx = self._make_state_context()
             call_next_called = False
 
             async def call_next(context):
@@ -593,7 +614,7 @@ class UnityInstanceMiddlewareTests(unittest.TestCase):
 
             context = SimpleNamespace(
                 fastmcp_context=ctx,
-                message=SimpleNamespace(name="manage_scene"),
+                message=SimpleNamespace(name="manage_scene", arguments={"action": "get_hierarchy"}),
             )
             result = await middleware.on_call_tool(context, call_next)
             self.assertTrue(call_next_called)

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 import asyncio
 
 from models.models import ToolDefinitionModel
+from services.state.connection_journal import ConnectionJournal
 
 
 @dataclass(slots=True)
@@ -29,20 +30,19 @@ class PluginSession:
     package_version: str | None = None
     current_scene: str | None = None
     capabilities_version: str | None = None
+    last_disconnected_at: datetime | None = None
+    last_disconnect_reason: str | None = None
 
 
 class PluginRegistry:
-    """Stores active plugin sessions in-memory.
+    """Track active connections and bounded, per-project disconnect history."""
 
-    The registry is optimised for quick lookup by either ``session_id`` or
-    ``project_hash`` (which is used as the canonical "instance id" across the
-    HTTP command routing stack).
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, journal: ConnectionJournal | None = None) -> None:
         self._sessions: dict[str, PluginSession] = {}
         self._hash_to_session: dict[str, str] = {}
+        self._disconnected: dict[str, PluginSession] = {}
         self._lock = asyncio.Lock()
+        self._journal = journal
 
     async def register(
         self,
@@ -55,15 +55,21 @@ class PluginRegistry:
         current_scene: str | None = None,
         capabilities_version: str | None = None,
     ) -> PluginSession:
-        """Register (or replace) a plugin session.
-
-        If an existing session already claims the same ``project_hash`` it will be
-        replaced, ensuring that reconnect scenarios always map to the latest
-        WebSocket connection.
-        """
-
         async with self._lock:
             now = datetime.now(timezone.utc)
+            previous = self._disconnected.get(project_hash)
+            previous_session_id = self._hash_to_session.get(project_hash)
+            replaced = self._sessions.pop(previous_session_id, None) if previous_session_id else None
+            if replaced is not None:
+                previous = replace(
+                    replaced,
+                    tools=dict(replaced.tools),
+                    last_disconnected_at=now,
+                    last_disconnect_reason="session_replaced",
+                )
+                self._disconnected[project_hash] = previous
+                if self._journal is not None:
+                    self._journal.record_disconnected(previous)
             session = PluginSession(
                 session_id=session_id,
                 project_name=project_name,
@@ -76,16 +82,35 @@ class PluginRegistry:
                 package_version=package_version,
                 current_scene=current_scene,
                 capabilities_version=capabilities_version,
+                tools=dict(previous.tools) if previous else {},
+                last_disconnected_at=previous.last_disconnected_at if previous else None,
+                last_disconnect_reason=previous.last_disconnect_reason if previous else None,
             )
-
-            # Remove old mapping for this hash if it existed under a different session
-            previous_session_id = self._hash_to_session.get(project_hash)
-            if previous_session_id and previous_session_id != session_id:
-                self._sessions.pop(previous_session_id, None)
-
             self._sessions[session_id] = session
             self._hash_to_session[project_hash] = session_id
+            self._disconnected.pop(project_hash, None)
+            while len(self._disconnected) > 128:
+                oldest = min(self._disconnected.values(), key=lambda item: item.last_disconnected_at)
+                del self._disconnected[oldest.project_hash]
             return session
+
+    @property
+    def has_connection_journal(self) -> bool:
+        return self._journal is not None
+
+    def record_connected(self, session: PluginSession) -> None:
+        if self._journal is not None:
+            self._journal.record_connected(session)
+
+    def close_journal(self) -> None:
+        if self._journal is not None:
+            self._journal.close()
+
+    async def connection_events(self, project_hash: str, limit: int = 20) -> dict[str, object]:
+        if self._journal is None:
+            return {"persistent": False, "path": None, "events": [], "error": None}
+        async with self._lock:
+            return self._journal.recent(project_hash, limit)
 
     async def touch(self, session_id: str) -> None:
         """Refresh the ``last_seen`` liveness timestamp for a session.
@@ -99,16 +124,25 @@ class PluginRegistry:
             if session:
                 session.last_seen = datetime.now(timezone.utc)
 
-    async def unregister(self, session_id: str) -> None:
-        """Remove a plugin session from the registry."""
-
+    async def unregister(self, session_id: str, reason: str | None = None) -> None:
+        """Disconnect a session without letting an old socket overwrite a newer registration."""
         async with self._lock:
             session = self._sessions.pop(session_id, None)
-            if session and session.project_hash in self._hash_to_session:
-                # Only delete the mapping if it still points at the removed session.
-                mapped = self._hash_to_session.get(session.project_hash)
-                if mapped == session_id:
-                    del self._hash_to_session[session.project_hash]
+            if session is None or self._hash_to_session.get(session.project_hash) != session_id:
+                return
+            del self._hash_to_session[session.project_hash]
+            snapshot = replace(
+                session,
+                tools=dict(session.tools),
+                last_disconnected_at=datetime.now(timezone.utc),
+                last_disconnect_reason=reason or "websocket_closed",
+            )
+            self._disconnected[session.project_hash] = snapshot
+            if self._journal is not None:
+                self._journal.record_disconnected(snapshot)
+            while len(self._disconnected) > 128:
+                oldest = min(self._disconnected.values(), key=lambda item: item.last_disconnected_at)
+                del self._disconnected[oldest.project_hash]
 
     async def register_tools_for_session(self, session_id: str, tools: list[ToolDefinitionModel]) -> None:
         """Register tools for a specific session."""
@@ -159,6 +193,14 @@ class PluginRegistry:
 
         async with self._lock:
             return dict(self._sessions)
+
+    async def list_disconnected(self) -> dict[str, PluginSession]:
+        """Return the latest disconnected snapshot for each bounded project history entry."""
+        async with self._lock:
+            return {
+                project_hash: replace(session, tools=dict(session.tools))
+                for project_hash, session in self._disconnected.items()
+            }
 
 
 __all__ = ["PluginRegistry", "PluginSession"]

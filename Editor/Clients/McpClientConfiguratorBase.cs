@@ -56,27 +56,7 @@ namespace MCPForUnity.Editor.Clients
             return client.linuxConfigPath;
         }
 
-        protected bool UrlsEqual(string a, string b)
-        {
-            if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b))
-            {
-                return false;
-            }
-
-            if (Uri.TryCreate(a.Trim(), UriKind.Absolute, out var uriA) &&
-                Uri.TryCreate(b.Trim(), UriKind.Absolute, out var uriB))
-            {
-                return Uri.Compare(
-                           uriA,
-                           uriB,
-                           UriComponents.HttpRequestUrl,
-                           UriFormat.SafeUnescaped,
-                           StringComparison.OrdinalIgnoreCase) == 0;
-            }
-
-            string Normalize(string value) => value.Trim().TrimEnd('/');
-            return string.Equals(Normalize(a), Normalize(b), StringComparison.OrdinalIgnoreCase);
-        }
+        protected bool UrlsEqual(string a, string b) => ConfigJsonBuilder.UrlsEqual(a, b);
     }
 
     /// <summary>JSON-file based configurator (Cursor, Windsurf, VS Code, etc.).</summary>
@@ -97,54 +77,14 @@ namespace MCPForUnity.Editor.Clients
                     return client.status;
                 }
 
-                string configJson = File.ReadAllText(path);
-                string[] args = null;
-                string configuredUrl = null;
-                bool configExists = false;
-
-                if (client.IsVsCodeLayout)
-                {
-                    var vsConfig = JsonConvert.DeserializeObject<JToken>(configJson) as JObject;
-                    if (vsConfig != null)
-                    {
-                        var unityToken =
-                            vsConfig["servers"]?["unityMCP"]
-                            ?? vsConfig["mcp"]?["servers"]?["unityMCP"];
-
-                        if (unityToken is JObject unityObj)
-                        {
-                            configExists = true;
-
-                            var argsToken = unityObj["args"];
-                            if (argsToken is JArray)
-                            {
-                                args = argsToken.ToObject<string[]>();
-                            }
-
-                            var urlToken = unityObj["url"] ?? unityObj["serverUrl"];
-                            if (urlToken != null && urlToken.Type != JTokenType.Null)
-                            {
-                                configuredUrl = urlToken.ToString();
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    McpConfig standardConfig = JsonConvert.DeserializeObject<McpConfig>(configJson);
-                    if (standardConfig?.mcpServers?.unityMCP != null)
-                    {
-                        args = standardConfig.mcpServers.unityMCP.args;
-                        configExists = true;
-                    }
-                }
-
-                if (!configExists)
+                var root = JObject.Parse(File.ReadAllText(path));
+                if (!ConfigJsonBuilder.TryGetUnityServer(root, client, out var unity))
                 {
                     client.SetStatus(McpStatus.MissingConfig);
                     return client.status;
                 }
-
+                string[] args = unity["args"] is JArray argsToken ? argsToken.ToObject<string[]>() : null;
+                string configuredUrl = (unity[client.HttpUrlProperty] ?? unity["url"] ?? unity["serverUrl"])?.ToString();
                 bool matches = false;
                 if (args != null && args.Length > 0)
                 {
@@ -209,7 +149,9 @@ namespace MCPForUnity.Editor.Clients
         {
             try
             {
-                string uvx = GetUvxPathOrError();
+                string uvx = client.SupportsHttpTransport && McpProjectSettings.GetUseHttpTransport()
+                    ? null
+                    : GetUvxPathOrError();
                 return ConfigJsonBuilder.BuildManualConfigJson(uvx, client);
             }
             catch (Exception ex)

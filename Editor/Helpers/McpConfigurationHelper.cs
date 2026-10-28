@@ -49,64 +49,31 @@ namespace MCPForUnity.Editor.Helpers
                 }
                 catch (Exception e)
                 {
-                    McpLog.Warn($"Error reading existing config: {e.Message}.");
+                    throw new IOException($"UnityMCP: Could not read existing configuration '{configPath}'.", e);
                 }
             }
 
-            // Parse the existing JSON while preserving all properties
-            dynamic existingConfig;
+            JObject existingConfig;
             try
             {
-                if (string.IsNullOrWhiteSpace(existingJson))
-                {
-                    existingConfig = new JObject();
-                }
-                else
-                {
-                    existingConfig = JsonConvert.DeserializeObject(existingJson) ?? new JObject();
-                }
+                existingConfig = string.IsNullOrWhiteSpace(existingJson)
+                    ? new JObject()
+                    : JObject.Parse(existingJson);
             }
-            catch
+            catch (JsonException ex)
             {
-                // If user has partial/invalid JSON (e.g., mid-edit), start from a fresh object
-                if (!string.IsNullOrWhiteSpace(existingJson))
-                {
-                    McpLog.Warn("UnityMCP: Configuration file could not be parsed; rewriting server block.");
-                }
-                existingConfig = new JObject();
+                throw new InvalidDataException(
+                    $"UnityMCP: '{configPath}' is invalid JSON; the original file was left unchanged.", ex);
             }
 
-            // Determine existing entry references (command/args)
-            string existingCommand = null;
-            string[] existingArgs = null;
-            bool isVSCode = (mcpClient?.IsVsCodeLayout == true);
-            try
+            string uvxPath = null;
+            if (mcpClient?.SupportsHttpTransport == false || !McpProjectSettings.GetUseHttpTransport())
             {
-                if (isVSCode)
-                {
-                    existingCommand = existingConfig?.servers?.unityMCP?.command?.ToString();
-                    existingArgs = existingConfig?.servers?.unityMCP?.args?.ToObject<string[]>();
-                }
-                else
-                {
-                    existingCommand = existingConfig?.mcpServers?.unityMCP?.command?.ToString();
-                    existingArgs = existingConfig?.mcpServers?.unityMCP?.args?.ToObject<string[]>();
-                }
+                uvxPath = MCPServiceLocator.Paths.GetUvxPath();
+                if (uvxPath == null) return "uv package manager not found. Please install uv first.";
             }
-            catch { }
 
-            // 1) Start from existing, only fill gaps (prefer trusted resolver)
-            string uvxPath = MCPServiceLocator.Paths.GetUvxPath();
-            if (uvxPath == null) return "uv package manager not found. Please install uv first.";
-
-            // Ensure containers exist and write back configuration
-            JObject existingRoot;
-            if (existingConfig is JObject eo)
-                existingRoot = eo;
-            else
-                existingRoot = JObject.FromObject(existingConfig);
-
-            existingRoot = ConfigJsonBuilder.ApplyUnityServerToExistingConfig(existingRoot, uvxPath, mcpClient);
+            JObject existingRoot = ConfigJsonBuilder.ApplyUnityServerToExistingConfig(existingConfig, uvxPath, mcpClient);
 
             string mergedJson = JsonConvert.SerializeObject(existingRoot, jsonSettings);
 
@@ -137,22 +104,18 @@ namespace MCPForUnity.Editor.Helpers
                 }
                 catch (Exception e)
                 {
-                    McpLog.Warn($"UnityMCP: Failed to read Codex config '{configPath}': {e.Message}");
-                    existingToml = string.Empty;
+                    throw new IOException($"UnityMCP: Could not read Codex configuration '{configPath}'.", e);
                 }
             }
 
-            string existingCommand = null;
-            string[] existingArgs = null;
-            if (!string.IsNullOrWhiteSpace(existingToml))
+            string uvxPath = null;
+            if (!McpProjectSettings.GetUseHttpTransport())
             {
-                CodexConfigHelper.TryParseCodexServer(existingToml, out existingCommand, out existingArgs);
-            }
-
-            string uvxPath = MCPServiceLocator.Paths.GetUvxPath();
-            if (uvxPath == null)
-            {
-                return "uv package manager not found. Please install uv first.";
+                uvxPath = MCPServiceLocator.Paths.GetUvxPath();
+                if (uvxPath == null)
+                {
+                    return "uv package manager not found. Please install uv first.";
+                }
             }
 
             string updatedToml = CodexConfigHelper.UpsertCodexServerBlock(existingToml, uvxPath);

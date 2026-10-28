@@ -34,11 +34,59 @@ namespace MCPForUnity.Editor.Helpers
             if (root == null) root = new JObject();
             bool isVSCode = client?.IsVsCodeLayout == true;
             JObject container = isVSCode ? EnsureObject(root, "servers") : EnsureObject(root, "mcpServers");
-            JObject unity = container["unityMCP"] as JObject ?? new JObject();
+            string name = GetUnityServerName(root, client);
+            JObject unity = container[name] as JObject ?? new JObject();
             PopulateUnityNode(unity, uvPath, client, isVSCode);
-
-            container["unityMCP"] = unity;
+            container[name] = unity;
             return root;
+        }
+
+        public static bool TryGetUnityServer(JObject root, McpClient client, out JObject unity)
+        {
+            unity = null;
+            if (root == null) return false;
+            var container = client?.IsVsCodeLayout == true
+                ? root["servers"] ?? root["mcp"]?["servers"]
+                : root["mcpServers"];
+            if (container is not JObject servers) return false;
+            unity = servers[GetUnityServerName(root, client)] as JObject;
+            return unity != null;
+        }
+
+        public static bool UrlsEqual(string a, string b)
+        {
+            if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return false;
+            if (Uri.TryCreate(a.Trim(), UriKind.Absolute, out var uriA) &&
+                Uri.TryCreate(b.Trim(), UriKind.Absolute, out var uriB))
+            {
+                if (uriA.IsLoopback && uriB.IsLoopback)
+                {
+                    uriA = new UriBuilder(uriA) { Host = "127.0.0.1" }.Uri;
+                    uriB = new UriBuilder(uriB) { Host = "127.0.0.1" }.Uri;
+                }
+                return Uri.Compare(uriA, uriB, UriComponents.HttpRequestUrl,
+                    UriFormat.SafeUnescaped, StringComparison.OrdinalIgnoreCase) == 0;
+            }
+            return string.Equals(a.Trim().TrimEnd('/'), b.Trim().TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetUnityServerName(JObject root, McpClient client)
+        {
+            var container = client?.IsVsCodeLayout == true
+                ? root["servers"] ?? root["mcp"]?["servers"]
+                : root["mcpServers"];
+            if (container is not JObject servers || servers["unityMCP"] != null) return "unityMCP";
+            if (servers["unity-mcp"] is JObject legacy && IsRecognizedUnityServer(legacy)) return "unity-mcp";
+            if (servers["UnityMCP_8080"] is JObject qoderLegacy && IsRecognizedUnityServer(qoderLegacy)) return "UnityMCP_8080";
+            return "unityMCP";
+        }
+
+        private static bool IsRecognizedUnityServer(JObject server)
+        {
+            string url = (server["url"] ?? server["serverUrl"])?.ToString();
+            if (UrlsEqual(url, HttpEndpointUtility.GetMcpRpcUrl())) return true;
+            return server["args"] is JArray args && args.Values<string>().Any(value =>
+                string.Equals(value, "mcp-for-unity", StringComparison.OrdinalIgnoreCase));
         }
 
         /// <summary>
@@ -114,8 +162,11 @@ namespace MCPForUnity.Editor.Helpers
                 }
             }
 
-            // Remove type for non-VSCode clients
-            if (!isVSCode && unity["type"] != null)
+            if (client?.IncludeTransportType == true)
+            {
+                unity["type"] = useHttpTransport ? "http" : "stdio";
+            }
+            else if (!isVSCode && unity["type"] != null)
             {
                 unity.Remove("type");
             }

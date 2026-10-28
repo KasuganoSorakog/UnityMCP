@@ -191,7 +191,7 @@ namespace MCPForUnity.Editor.Tools
         }
 
         /// <summary>
-        /// Captures a screenshot to Assets/Screenshots and returns a response payload.
+        /// Captures a synchronous camera screenshot to Library/MCPScreenshots and returns a response payload.
         /// Public so the tools UI can reuse the same logic without duplicating parameters.
         /// Available in both Edit Mode and Play Mode.
         /// </summary>
@@ -384,40 +384,25 @@ namespace MCPForUnity.Editor.Tools
             try
             {
                 int resolvedSuperSize = (superSize.HasValue && superSize.Value > 0) ? superSize.Value : 1;
-                ScreenshotCaptureResult result;
-
-                if (Application.isPlaying)
+                Camera cam = Camera.main;
+                if (cam == null)
                 {
-                    result = ScreenshotUtility.CaptureToAssetsFolder(fileName, resolvedSuperSize, ensureUniqueFileName: true);
+                    cam = UnityEngine.Object.FindObjectsOfType<Camera>().FirstOrDefault();
                 }
-                else
+                if (cam == null)
                 {
-                    // Edit Mode path: render from the best-guess camera using RenderTexture.
-                    Camera cam = Camera.main;
-                    if (cam == null)
-                    {
-                        // Use FindObjectsOfType for Unity 2021 compatibility
-                        var cams = UnityEngine.Object.FindObjectsOfType<Camera>();
-                        cam = cams.FirstOrDefault();
-                    }
-
-                    if (cam == null)
-                    {
-                        return new ErrorResponse("No camera found to capture screenshot in Edit Mode.");
-                    }
-
-                    result = ScreenshotUtility.CaptureFromCameraToAssetsFolder(cam, fileName, resolvedSuperSize, ensureUniqueFileName: true);
+                    return new ErrorResponse("No camera found. Use capture_view with a target or an explicit camera preset.");
                 }
 
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
-
-                string message = $"Screenshot captured to '{result.AssetsRelativePath}' (full: {result.FullPath}).";
+                ScreenshotCaptureResult result = ScreenshotUtility.CaptureFromCamera(
+                    cam, fileName, resolvedSuperSize, ensureUniqueFileName: true);
+                string message = $"Screenshot captured to '{result.ProjectRelativePath}' (full: {result.FullPath}).";
 
                 return new SuccessResponse(
                     message,
                     new
                     {
-                        path = result.AssetsRelativePath,
+                        path = result.ProjectRelativePath,
                         fullPath = result.FullPath,
                         superSize = result.SuperSize,
                     }

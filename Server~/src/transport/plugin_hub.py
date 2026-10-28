@@ -272,14 +272,13 @@ class PluginHub(WebSocketEndpoint):
             session_id = next(
                 (sid for sid, ws in cls._connections.items() if ws is websocket), None)
         if session_id:
-            await cls._cleanup_session_locked(session_id)
+            await cls._cleanup_session_locked(session_id, f"websocket_close_{close_code}")
             logger.info(
                 f"Plugin session {session_id} disconnected ({close_code})")
 
     @classmethod
-    async def _cleanup_session_locked(cls, session_id: str) -> None:
-        """Idempotently tear down a session's connection, in-flight commands,
-        registry entry and scheduler state.
+    async def _cleanup_session_locked(cls, session_id: str, reason: str | None = None) -> None:
+        """Tear down a session and retain a bounded snapshot of its last known metadata.
 
         Acquires ``cls._lock`` internally; callers must NOT hold the lock.
         Safe to invoke multiple times for the same session.
@@ -308,7 +307,7 @@ class PluginHub(WebSocketEndpoint):
                         )
                     )
         if cls._registry:
-            await cls._registry.unregister(session_id)
+            await cls._registry.unregister(session_id, reason)
         if cls._scheduler:
             await cls._scheduler.forget_session(session_id)
 
@@ -762,7 +761,7 @@ class PluginHub(WebSocketEndpoint):
                     # drop the old session's state so reverse websocket lookups
                     # and the orphan sweep cannot misattribute this socket or
                     # close it out from under the new session.
-                    await cls._cleanup_session_locked(candidate_id)
+                    await cls._cleanup_session_locked(candidate_id, "session_replaced")
 
             session = await registry.register(
                 session_id,
@@ -788,8 +787,9 @@ class PluginHub(WebSocketEndpoint):
                     websocket.send_json(response.model_dump()),
                     timeout=cls.REGISTER_ACK_SEND_TIMEOUT_SECONDS,
                 )
+                registry.record_connected(session)
             except Exception:
-                await cls._cleanup_session_locked(session_id)
+                await cls._cleanup_session_locked(session_id, "registration_ack_failed")
                 # The eviction below never runs on this path, so the old socket
                 # is not being superseded after all; drop the mark with the
                 # rollback (the restored session owns the socket again).
@@ -1078,7 +1078,7 @@ class PluginHub(WebSocketEndpoint):
                 session.project_name,
                 session.project_hash,
             )
-            await cls._cleanup_session_locked(session_id)
+            await cls._cleanup_session_locked(session_id, "heartbeat_timeout")
             evicted += 1
 
         # Defense in depth: connections whose session is no longer in the
@@ -1110,7 +1110,7 @@ class PluginHub(WebSocketEndpoint):
                     )
                 except Exception:
                     pass
-                await cls._cleanup_session_locked(session_id)
+                await cls._cleanup_session_locked(session_id, "registry_missing")
 
         # Prune per-hash register locks whose project has no live session, so
         # a long-running server does not accumulate locks for closed projects.
