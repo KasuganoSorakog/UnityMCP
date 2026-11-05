@@ -209,7 +209,7 @@ namespace MCPForUnity.Editor.Helpers
 
                 if (!process.WaitForExit(timeoutMs))
                 {
-                    try { process.Kill(); } catch { }
+                    KillProcessTree(process);
                     return false;
                 }
 
@@ -224,6 +224,40 @@ namespace MCPForUnity.Editor.Helpers
             {
                 return false;
             }
+        }
+
+        // cmd.exe / shell wrappers outlive Process.Kill(), leaving uv and Python children
+        // running after a timeout. Kill the full tree so retries are not blocked by stale
+        // installers.
+        private static void KillProcessTree(Process process)
+        {
+            if (process == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    using var killer = Process.Start(new ProcessStartInfo("taskkill", $"/PID {process.Id} /T /F")
+                    {
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                    });
+                    killer?.WaitForExit(5000);
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                }
+            }
+            catch { }
         }
 
 #if UNITY_EDITOR_OSX || UNITY_EDITOR_LINUX

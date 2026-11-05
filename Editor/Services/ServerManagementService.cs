@@ -48,6 +48,10 @@ namespace MCPForUnity.Editor.Services
             "httpx"
         };
 
+        private const int UvProbeTimeoutMs = 30000;
+        private const int ServerDependencyInstallTimeoutMs = 15 * 60 * 1000;
+        private static readonly string BundledWheelhouseRelativePath = Path.Combine("offline", "wheels");
+
         // 版本探测用共享 HttpClient（CheckRunningServerVersion）：避免每次 new 的套接字开销，
         // 超时固定 3s。仅用于短小的 /plugin/diagnostics GET，无并发状态问题。
         private static readonly HttpClient VersionCheckHttpClient = new HttpClient
@@ -449,7 +453,12 @@ namespace MCPForUnity.Editor.Services
             }
         }
 
-        private bool ExecuteUvCommand(string uvCommand, string args, out string stdout, out string stderr)
+        private bool ExecuteUvCommand(
+            string uvCommand,
+            string args,
+            out string stdout,
+            out string stderr,
+            int timeoutMs = UvProbeTimeoutMs)
         {
             stdout = null;
             stderr = null;
@@ -459,7 +468,7 @@ namespace MCPForUnity.Editor.Services
 
             if (!string.Equals(uvCommand, uvPath, StringComparison.OrdinalIgnoreCase))
             {
-                return ExecPath.TryRun(uvCommand, args, Application.dataPath, out stdout, out stderr, 30000);
+                return ExecPath.TryRun(uvCommand, args, Application.dataPath, out stdout, out stderr, timeoutMs);
             }
 
             string command = $"{uvPath} {args}";
@@ -467,7 +476,7 @@ namespace MCPForUnity.Editor.Services
 
             if (Application.platform == RuntimePlatform.WindowsEditor)
             {
-                return ExecPath.TryRun("cmd.exe", $"/c {command}", Application.dataPath, out stdout, out stderr, 30000, extraPathPrepend);
+                return ExecPath.TryRun("cmd.exe", $"/c {command}", Application.dataPath, out stdout, out stderr, timeoutMs, extraPathPrepend);
             }
 
             string shell = File.Exists("/bin/bash") ? "/bin/bash" : "/bin/sh";
@@ -475,10 +484,10 @@ namespace MCPForUnity.Editor.Services
             if (!string.IsNullOrEmpty(shell) && File.Exists(shell))
             {
                 string escaped = command.Replace("\"", "\\\"");
-                return ExecPath.TryRun(shell, $"-lc \"{escaped}\"", Application.dataPath, out stdout, out stderr, 30000, extraPathPrepend);
+                return ExecPath.TryRun(shell, $"-lc \"{escaped}\"", Application.dataPath, out stdout, out stderr, timeoutMs, extraPathPrepend);
             }
 
-            return ExecPath.TryRun(uvPath, args, Application.dataPath, out stdout, out stderr, 30000, extraPathPrepend);
+            return ExecPath.TryRun(uvPath, args, Application.dataPath, out stdout, out stderr, timeoutMs, extraPathPrepend);
         }
 
         private static string BuildUvPathFromUvx(string uvxPath)
@@ -1402,14 +1411,46 @@ namespace MCPForUnity.Editor.Services
                 return true;
             }
 
+            string wheelhouse = Path.Combine(serverDirectory, BundledWheelhouseRelativePath);
+            string wheelhouseError;
+            if (Directory.Exists(wheelhouse) && Directory.EnumerateFiles(wheelhouse, "*.whl").Any())
+            {
+                McpLog.Info("检测到包内离线依赖，优先执行离线安装。");
+                if (TryInstallServerDependenciesFromWheelhouse(uvPath, serverDirectory, wheelhouse, out wheelhouseError))
+                {
+                    if (TryVerifyServerDependenciesOffline(uvPath, serverDirectory, out error))
+                    {
+                        return true;
+                    }
+
+                    wheelhouseError = error;
+                }
+                else
+                {
+                    McpLog.Warn($"包内离线依赖安装失败，将尝试联网：{wheelhouseError}");
+                }
+            }
+            else
+            {
+                wheelhouseError = $"包内未找到离线依赖目录: {wheelhouse}";
+            }
+
             if (!allowOnlineInitialize)
             {
+                error =
+                    "项目内 MCP Server 的本地依赖不完整，且无法完成离线安装。\n\n" +
+                    $"Server 目录: {serverDirectory}\n\n{wheelhouseError}";
                 return false;
             }
 
-            McpLog.Info("项目内 MCP Server 依赖未就绪，开始联网初始化一次。");
+            McpLog.Info("项目内 MCP Server 依赖未就绪，开始联网初始化一次（最长等待 15 分钟）。");
             string initArgs = $"run --project {QuoteArgument(serverDirectory)} --frozen python -c {QuoteArgument("import fastmcp")}";
-            if (!ExecuteUvCommand(uvPath, initArgs, out var initStdout, out var initStderr))
+            if (!ExecuteUvCommand(
+                    uvPath,
+                    initArgs,
+                    out var initStdout,
+                    out var initStderr,
+                    ServerDependencyInstallTimeoutMs))
             {
                 string combinedInitOutput = string.Join(
                     Environment.NewLine,
@@ -1422,11 +1463,80 @@ namespace MCPForUnity.Editor.Services
                 error =
                     "项目内 MCP Server 初始化失败。请检查网络、uv、Python 版本或依赖源配置。\n\n" +
                     $"Server 目录: {serverDirectory}\n\n" +
+                    $"包内离线依赖: {wheelhouseError}\n\n" +
                     combinedInitOutput;
                 return false;
             }
 
             return TryVerifyServerDependenciesOffline(uvPath, serverDirectory, out error);
+        }
+
+        private bool TryInstallServerDependenciesFromWheelhouse(
+            string uvPath,
+            string serverDirectory,
+            string wheelhouse,
+            out string error)
+        {
+            error = null;
+            string venvPath = Path.Combine(serverDirectory, ".venv");
+            string venvPython = GetVirtualEnvironmentPythonPath(venvPath);
+
+            if (!File.Exists(venvPython))
+            {
+                string venvArgs = $"venv --allow-existing {QuoteArgument(venvPath)}";
+                if (!ExecuteUvCommand(
+                        uvPath,
+                        venvArgs,
+                        out var venvStdout,
+                        out var venvStderr,
+                        ServerDependencyInstallTimeoutMs))
+                {
+                    error = BuildUvFailure("uv 创建虚拟环境失败", venvStdout, venvStderr);
+                    return false;
+                }
+
+                if (!File.Exists(venvPython))
+                {
+                    error = $"uv 创建虚拟环境后未找到 Python: {venvPython}";
+                    return false;
+                }
+            }
+
+            // uv sync --frozen uses the exact PyPI URLs in uv.lock and ignores --find-links.
+            // uv pip install resolves the locked versions from the bundled wheelhouse instead.
+            string args =
+                $"pip install --python {QuoteArgument(venvPython)} --offline " +
+                $"--find-links {QuoteArgument(wheelhouse)} --no-progress -e {QuoteArgument(serverDirectory)}";
+
+            if (ExecuteUvCommand(
+                    uvPath,
+                    args,
+                    out var stdout,
+                    out var stderr,
+                    ServerDependencyInstallTimeoutMs))
+            {
+                return true;
+            }
+
+            error = BuildUvFailure("uv 离线安装失败", stdout, stderr);
+            return false;
+        }
+
+        private static string GetVirtualEnvironmentPythonPath(string venvPath)
+        {
+            return Application.platform == RuntimePlatform.WindowsEditor
+                ? Path.Combine(venvPath, "Scripts", "python.exe")
+                : Path.Combine(venvPath, "bin", "python");
+        }
+
+        private static string BuildUvFailure(string prefix, string stdout, string stderr)
+        {
+            string output = string.Join(
+                Environment.NewLine,
+                new[] { stderr, stdout }.Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()));
+            return string.IsNullOrWhiteSpace(output)
+                ? $"{prefix}，但没有返回详细输出。"
+                : $"{prefix}：\n\n{output}";
         }
 
         private bool TryVerifyServerDependenciesOffline(string uvPath, string serverDirectory, out string error)

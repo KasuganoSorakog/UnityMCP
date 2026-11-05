@@ -8,6 +8,7 @@
 - `Runtime/` — 运行时程序集，尽量少改，避免影响打包。
 - `Server~/` — 中心 Python MCP 服务端（多项目路由、写锁、日志、工具包装）。`~` 使 Unity 不导入该目录。
 - `Server~/tests/` — 唯一的自动化测试入口：`cd Server~ && uv run --extra dev pytest`。仓库内没有 C# 测试程序集，不要新建测试脚手架。
+- `Server~/offline/wheels/` — 随包分发的离线依赖，只能由 `Server~/scripts/build_offline_wheelhouse.py` 生成；修改 `pyproject.toml` 或 `uv.lock` 后必须重建并一起提交。
 - 新增/改名 Unity 侧资源要一并处理 `.meta`；不要为了跑通测试而修改业务项目的 `manifest.json`。
 
 ## 工具名到实现的映射

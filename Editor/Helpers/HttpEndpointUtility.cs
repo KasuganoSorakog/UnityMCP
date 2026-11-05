@@ -264,11 +264,9 @@ namespace MCPForUnity.Editor.Helpers
 
             if (mode == "project-local")
             {
-                string local = GetProjectLocalServerPath();
-                if (!string.IsNullOrEmpty(local) && File.Exists(Path.Combine(local, "pyproject.toml")))
-                {
-                    return local;
-                }
+                // Must be returned even before first deployment: the server directory is
+                // created by ServerDeploymentService, which runs after source resolution.
+                return GetProjectLocalServerPath();
             }
 
             return fallbackFactory?.Invoke();
@@ -276,8 +274,7 @@ namespace MCPForUnity.Editor.Helpers
 
         public static string GetProjectLocalServerPath()
         {
-            string path = Path.Combine(ProjectRootPath, "Tools", "MCPForUnityServer");
-            return Directory.Exists(path) ? path : null;
+            return Path.Combine(ProjectRootPath, "Tools", "MCPForUnityServer");
         }
 
         private static McpProjectSettings CreateMigratedDefaults()

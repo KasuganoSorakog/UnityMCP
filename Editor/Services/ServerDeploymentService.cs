@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 using MCPForUnity.Editor.Helpers;
 using UnityEngine;
@@ -76,7 +77,7 @@ namespace MCPForUnity.Editor.Services
             {
                 string projectVersion = ReadServerVersion(projectPyproject);
                 if (string.Equals(projectVersion, bundledVersion, StringComparison.Ordinal)
-                    && IsDeploymentComplete(projectPath))
+                    && IsDeploymentComplete(projectPath, requireWheelhouse: HasWheelhouse(bundledPath)))
                 {
                     // 已部署且版本一致，直接使用项目内服务端。
                     return true;
@@ -105,7 +106,7 @@ namespace MCPForUnity.Editor.Services
         /// The stamp file is written only after the full copy completes, and the
         /// delete phase removes it first — so its presence proves completeness.
         /// </summary>
-        private static bool IsDeploymentComplete(string projectPath)
+        private static bool IsDeploymentComplete(string projectPath, bool requireWheelhouse)
         {
             // 目录指纹与包内 Server~/src 的实际目录（core/models/services/transport/utils）及 tests 一一对齐
             return File.Exists(Path.Combine(projectPath, "uv.lock"))
@@ -116,7 +117,20 @@ namespace MCPForUnity.Editor.Services
                 && Directory.Exists(Path.Combine(projectPath, "src", "transport"))
                 && Directory.Exists(Path.Combine(projectPath, "src", "utils"))
                 && Directory.Exists(Path.Combine(projectPath, "tests"))
-                && File.Exists(Path.Combine(projectPath, DeployStampFileName));
+                && File.Exists(Path.Combine(projectPath, DeployStampFileName))
+                && (!requireWheelhouse || HasWheelhouse(projectPath));
+        }
+
+        private static bool HasWheelhouse(string serverRoot)
+        {
+            if (string.IsNullOrEmpty(serverRoot))
+            {
+                return false;
+            }
+
+            string wheelhouse = Path.Combine(serverRoot, "offline", "wheels");
+            return Directory.Exists(wheelhouse)
+                && Directory.EnumerateFiles(wheelhouse, "*.whl").Any();
         }
 
         /// <summary>
@@ -126,7 +140,9 @@ namespace MCPForUnity.Editor.Services
         /// </summary>
         public static bool HasRunnableProjectServer()
         {
-            return IsDeploymentComplete(GetProjectServerPath());
+            return IsDeploymentComplete(
+                GetProjectServerPath(),
+                requireWheelhouse: HasWheelhouse(GetBundledServerPath()));
         }
 
         /// <summary>

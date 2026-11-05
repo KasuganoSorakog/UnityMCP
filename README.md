@@ -34,13 +34,16 @@ Fork 自 [CoplayDev/unity-mcp](https://github.com/CoplayDev/unity-mcp)（MIT）�
 1. 打开 **Window → Unity MCP Window**（快捷键 Ctrl+Shift+M）。
 2. 点 **启动 Server**：
    - 首次启动：自动把包内 `Server~/` 部署到 `<项目>/Tools/MCPForUnityServer`（排除 `.venv` 等运行产物），随后正常拉起。
+   - 依赖优先从包内 `Server~/offline/wheels` 离线安装，不需要访问 PyPI。
    - 后续启动：直接使用项目内的服务端目录。
-   - 包升级后（服务端 `version` 变化）：下次启动自动覆盖同步源码，`uv run --frozen` 会按新 `uv.lock` 自动补齐依赖。
+   - 包升级后（服务端 `version` 变化）：下次启动自动覆盖同步源码并重新校验依赖。
 3. 中心 Server 全机只有一个（占用 8080）；多个 Unity 项目可并行开启，都连接同一个中心 Server，按项目路由会话、互不顶替（同项目重复连接才触发顶替通知）。
 
 ### 首次启动的网络说明
 
-首次启动时 `uv` 需要联网：自动下载 Python 3.11+ 运行时并按 `uv.lock` 安装依赖（PyPI）。网络受限时可用环境变量切换镜像：
+包内 wheelhouse 覆盖 **Windows x64、CPython 3.11–3.14**，命中时依赖安装通常只需数秒，不访问网络。其他平台、其他 Python 版本或 wheelhouse 损坏时才回退到联网安装；联网初始化最长等待 15 分钟，不会在 30 秒时误报失败。
+
+联网回退和首次安装 Python 运行时仍可配置镜像：
 
 ```bash
 # PyPI 镜像（清华）
@@ -57,6 +60,8 @@ UnityMCP/
 ├── Editor/           # 编辑器端 C#（桥接、UI、服务定位）
 ├── Runtime/          # 运行时 C#
 └── Server~/          # Python MCP 服务端（~ 目录 Unity 不导入，随包分发）
+    ├── offline/wheels/  # 离线依赖 wheelhouse（Windows x64, CPython 3.11–3.14）
+    ├── scripts/         # wheelhouse 重建脚本
     ├── pyproject.toml
     ├── src/
     └── tests/
