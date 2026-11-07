@@ -6,6 +6,7 @@ using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Dependencies.Models;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Windows.Components.CameraShots;
 using MCPForUnity.Editor.Windows.Components.ClientConfig;
 using MCPForUnity.Editor.Windows.Components.Connection;
 using MCPForUnity.Editor.Windows.Components.Diagnostics;
@@ -26,6 +27,7 @@ namespace MCPForUnity.Editor.Windows
         private McpSettingsSection settingsSection;
         private McpConnectionSection connectionSection;
         private McpClientConfigSection clientConfigSection;
+        private McpCameraShotsSection cameraShotsSection;
         private McpToolsSection toolsSection;
         private McpDiagnosticsSection diagnosticsSection;
         private McpSetupSection setupSection;
@@ -258,6 +260,21 @@ namespace MCPForUnity.Editor.Windows
                 clientConfigSection = new McpClientConfigSection(clientConfigRoot);
             }
 
+            // Load and initialize Camera Shots section
+            var cameraShotsTree = AssetDatabase.LoadAssetAtPath<VisualTreeAsset>(
+                $"{basePath}/Editor/Windows/Components/CameraShots/McpCameraShotsSection.uxml"
+            );
+            if (cameraShotsTree != null)
+            {
+                var cameraShotsRoot = cameraShotsTree.Instantiate();
+                settingsContainer.Add(cameraShotsRoot);
+                cameraShotsSection = new McpCameraShotsSection(cameraShotsRoot);
+            }
+            else
+            {
+                McpLog.Warn("Failed to load camera shots section UXML. Camera shot saving will be unavailable.");
+            }
+
             // Load and initialize Tools section
             var toolsTree = AssetDatabase.LoadAssetAtPath<VisualTreeAsset>(
                 $"{basePath}/Editor/Windows/Components/Tools/McpToolsSection.uxml"
@@ -400,6 +417,7 @@ namespace MCPForUnity.Editor.Windows
 
             lastPassiveUiRefreshTime = currentTime;
             connectionSection?.UpdateConnectionStatus();
+            cameraShotsSection?.UpdateInteractivity();
             UpdateHeaderStatus();
         }
 

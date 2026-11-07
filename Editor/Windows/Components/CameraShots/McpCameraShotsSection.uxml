@@ -1,0 +1,14 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements" editor-extension-mode="True">
+    <ui:VisualElement name="camera-shots-section" class="section">
+        <ui:Label text="相机快照" class="section-title" />
+        <ui:VisualElement class="section-content">
+            <ui:Label name="camera-shots-help" class="help-text" text="把当前 Scene 视图相机保存为可复用的 MCP 快照预设，AI 可以按名称调用。" />
+            <ui:TextField name="shot-name-field" label="预设名称" />
+            <ui:Toggle name="follow-target-toggle" label="跟随选中物体（位置与旋转）" />
+            <ui:VisualElement class="setting-row">
+                <ui:Button name="save-shot-button" text="保存当前 Scene 视图" class="action-button" />
+            </ui:VisualElement>
+            <ui:Label name="shot-status" class="help-text" />
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>
